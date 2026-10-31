@@ -40,12 +40,15 @@ enum MediaProbe {
         guard !timestamps.isEmpty else { throw EnhancedPlayerError.noKeyframeIndex }
 
         var audio = audioTracks(demuxer)
-        let (presentationOffset, atmos) = try scanStart(demuxer: demuxer, videoIndex: videoIndex, audio: audio, usesDTS: usesDTS)
+        let (presentationOffset, atmos, firstSample) = try scanStart(demuxer: demuxer, videoIndex: videoIndex, audio: audio, usesDTS: usesDTS)
         for i in audio.indices where atmos.contains(audio[i].streamIndex) {
             audio[i].isAtmos = true
         }
 
-        let video = try videoTrack(videoStream, index: videoIndex)
+        var video = try videoTrack(videoStream, index: videoIndex)
+        if video.codec == .hevc, let record = firstSample.withUnsafeBufferPointer({ HEVCConfigurationRecord.filling(video.extradata, from: $0) }) {
+            video.extradata = record
+        }
         let tb = video.timeBase
         var end: Int64
         if videoStream.pointee.duration != FF.noPTS, videoStream.pointee.duration > 0 {
@@ -170,17 +173,20 @@ enum MediaProbe {
 
     /// Reads the first packets once: the first video packet gives the pts−dts offset
     /// for DTS-indexed files, and decoding one E-AC-3 frame per track reveals Atmos
-    /// (JOC), which only the decoder reports.
-    private static func scanStart(demuxer: Demuxer, videoIndex: Int32, audio: [AudioTrack], usesDTS: Bool) throws -> (Int64, Set<Int32>) {
+    /// (JOC), which only the decoder reports. The first video packet's bytes come back too,
+    /// for a file whose parameter sets are only in-band.
+    private static func scanStart(demuxer: Demuxer, videoIndex: Int32, audio: [AudioTrack], usesDTS: Bool) throws -> (Int64, Set<Int32>, [UInt8]) {
         var pendingEAC3 = Set(audio.filter { $0.codecID == AV_CODEC_ID_EAC3.rawValue && !$0.isAtmos }.map(\.streamIndex))
         var atmos = Set<Int32>()
         var offset: Int64?
+        var firstSample: [UInt8] = []
         let packet = Packet()
         var read = 0
         while (offset == nil || !pendingEAC3.isEmpty), read < 2000, try demuxer.read(into: packet) {
             read += 1
             if packet.streamIndex == videoIndex, offset == nil {
                 offset = (usesDTS && packet.pts != FF.noPTS && packet.dts != FF.noPTS) ? packet.pts - packet.dts : 0
+                firstSample = Array(UnsafeBufferPointer(start: packet.pointer.pointee.data, count: Int(packet.pointer.pointee.size)))
             } else if pendingEAC3.contains(packet.streamIndex) {
                 pendingEAC3.remove(packet.streamIndex)
                 if decodedProfile(packet, stream: demuxer.stream(packet.streamIndex)) == AV_PROFILE_EAC3_DDP_ATMOS {
@@ -188,7 +194,7 @@ enum MediaProbe {
                 }
             }
         }
-        return (offset ?? 0, atmos)
+        return (offset ?? 0, atmos, firstSample)
     }
 
     private static func decodedProfile(_ packet: Packet, stream: UnsafeMutablePointer<AVStream>) -> Int32? {

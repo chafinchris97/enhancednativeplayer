@@ -95,16 +95,18 @@ struct VideoProducer: SegmentProducer {
             par.pointee.color_primaries = AVCOL_PRI_BT709
             par.pointee.color_trc = AVCOL_TRC_BT709
             par.pointee.color_space = AVCOL_SPC_BT709
-            av_freep(&par.pointee.extradata)
-            let size = rewriter.extradata.count
-            guard let extradata = av_mallocz(size + Int(AV_INPUT_BUFFER_PADDING_SIZE))?.assumingMemoryBound(to: UInt8.self) else {
-                par.pointee.extradata_size = 0
-                throw EnhancedPlayerError.ffmpeg(operation: "av_mallocz", code: -ENOMEM, message: "out of memory")
-            }
-            extradata.update(from: rewriter.extradata, count: size)
-            par.pointee.extradata = extradata
-            par.pointee.extradata_size = Int32(size)
         }
+        // The probe's record, not the container's, which may lack the parameter sets.
+        let record = rewriter?.extradata ?? video.extradata
+        let par = output.codecpar
+        av_freep(&par.pointee.extradata)
+        guard let extradata = av_mallocz(record.count + Int(AV_INPUT_BUFFER_PADDING_SIZE))?.assumingMemoryBound(to: UInt8.self) else {
+            par.pointee.extradata_size = 0
+            throw EnhancedPlayerError.ffmpeg(operation: "av_mallocz", code: -ENOMEM, message: "out of memory")
+        }
+        extradata.update(from: record, count: record.count)
+        par.pointee.extradata = extradata
+        par.pointee.extradata_size = Int32(record.count)
         output.pointee.time_base = input.pointee.time_base
     }
 }

@@ -191,6 +191,58 @@ struct SDRBitstreamRewriterTests {
     }
 }
 
+struct HEVCConfigurationRecordTests {
+    private let vps: [UInt8] = [0x40, 0x01, 0x0C]
+    private let sps: [UInt8] = [0x42, 0x01, 0x01]
+    private let pps: [UInt8] = [0x44, 0x01, 0xC0]
+    private let aud: [UInt8] = [0x46, 0x01, 0x50]
+    private let slice: [UInt8] = [0x26, 0x01, 0xAF]
+
+    private var empty: [UInt8] {
+        var record = [UInt8](repeating: 0, count: 23)
+        record[0] = 1
+        record[21] = 0x0F
+        return record
+    }
+
+    private func sample(_ nals: [[UInt8]]) -> [UInt8] {
+        nals.flatMap { [0, 0, 0, UInt8($0.count)] + $0 }
+    }
+
+    private func filling(_ record: [UInt8], _ nals: [[UInt8]]) -> [UInt8]? {
+        sample(nals).withUnsafeBufferPointer { HEVCConfigurationRecord.filling(record, from: $0) }
+    }
+
+    @Test func emptyRecordGetsTheInBandSets() {
+        let expected = Array(empty[0..<22]) + [3]
+            + [32, 0, 1, 0, 3] + vps
+            + [33, 0, 1, 0, 3] + sps
+            + [34, 0, 1, 0, 3] + pps
+        #expect(filling(empty, [aud, vps, sps, pps, slice]) == expected)
+    }
+
+    @Test func recordWithArraysIsLeftAlone() {
+        var record = empty
+        record[22] = 1
+        #expect(filling(record + [32, 0, 1, 0, 3] + vps, [vps, sps, pps, slice]) == nil)
+    }
+
+    @Test func sampleWithoutEverySetChangesNothing() {
+        #expect(filling(empty, [vps, sps, slice]) == nil)
+    }
+
+    @Test func truncatedSampleChangesNothing() {
+        let bytes: [UInt8] = [0, 0, 0, 200, 0x40, 0x01]
+        #expect(bytes.withUnsafeBufferPointer { HEVCConfigurationRecord.filling(empty, from: $0) } == nil)
+    }
+
+    @Test func filledRecordSurvivesTheSDRRewrite() throws {
+        let filled = try #require(filling(empty, [vps, sps, pps, slice]))
+        let rewriter = try #require(SDRBitstreamRewriter(codec: .hevc, extradata: filled))
+        #expect(rewriter.extradata == filled)
+    }
+}
+
 struct DisplayRefusalTests {
     @Test func recognisesDisplayRefusalsOnly() {
         #expect(DisplayRefusal.matches(NSError(domain: AVFoundationErrorDomain, code: -11868)))

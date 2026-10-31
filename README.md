@@ -52,6 +52,7 @@ A run that starts at segment k must emit exactly what a run from the beginning w
 
 - **Audio labels.** AVFoundation derives an option's `displayName`, which the AVPlayerViewController audio menu shows, from `LANGUAGE` and ignores `NAME`. The `{Language} - {Title} - {Codec}` label is therefore written to both. As a result, AVPlayer does not auto-select by the user's preferred language; the container's default track is marked `DEFAULT=YES`.
 - **Dolby Vision profile 8** gets a second variant with a plain `hvc1` `CODECS` string as an HDR10/HLG fallback.
+- **Parameter sets only in-band.** Some HEVC files have an empty `hvcC` and carry VPS / SPS / PPS at each keyframe. AVPlayer fails on such a sample entry with CoreMedia `-19601`, so the probe fills the record from the first video packet.
 - **Lossy sources in FLAC.** For DTS core, Opus, MP3 and other lossy sources transcoded to FLAC, a restarted run has identical timing. The PCM can differ in the lowest bits, because lossy decoder state never re-converges bit-exactly after a seek. Lossless sources (DTS-HD MA, TrueHD, PCM) are bit-identical.
 - **Codecs.** Video must be H.264 or HEVC. TrueHD Atmos and DTS:X objects are lost in the FLAC path; only the bed is kept.
 - **Keyframe index required.** A file without a keyframe index (Matroska without Cues) is rejected rather than downloaded in full.
