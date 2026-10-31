@@ -1,3 +1,4 @@
+import AVFoundation
 import Testing
 @testable import EnhancedNativePlayer
 
@@ -187,6 +188,17 @@ struct SDRBitstreamRewriterTests {
         #expect(HLSRoute(fileName: "init_video_sdr.mp4") == .sdrVideoInit)
         #expect(HLSRoute(fileName: "video_sdr_12.mp4") == .sdrVideoSegment(12))
         #expect(HLSRoute(fileName: "video_12.mp4") == .videoSegment(12))
+    }
+}
+
+struct DisplayRefusalTests {
+    @Test func recognisesDisplayRefusalsOnly() {
+        #expect(DisplayRefusal.matches(NSError(domain: AVFoundationErrorDomain, code: -11868)))
+        #expect(DisplayRefusal.matches(NSError(domain: AVFoundationErrorDomain, code: -11848)))
+        #expect(DisplayRefusal.matches(NSError(domain: NSURLErrorDomain, code: NSURLErrorUnsupportedURL)))
+        #expect(!DisplayRefusal.matches(NSError(domain: AVFoundationErrorDomain, code: -11800)))
+        #expect(!DisplayRefusal.matches(NSError(domain: NSURLErrorDomain, code: NSURLErrorTimedOut)))
+        #expect(!DisplayRefusal.matches(NSError(domain: "CoreMediaErrorDomain", code: -11868)))
     }
 }
 

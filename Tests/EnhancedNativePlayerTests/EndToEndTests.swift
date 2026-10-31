@@ -179,6 +179,20 @@ struct EndToEndTests {
     }
 
     #if os(tvOS)
+    /// The simulator has no HDR display, so it refuses an HDR master the way an SDR TV does.
+    @MainActor
+    @Test func hdrMasterRefusalIsRecognised() async throws {
+        let session = try await EnhancedPlaybackSession.start(url: source)
+        defer { Task { await session.stop() } }
+        guard session.sdrMasterPlaylistURL != nil else { return }
+        let item = AVPlayerItem(url: session.masterPlaylistURL)
+        let player = AVPlayer(playerItem: item)
+        player.isMuted = true
+        try await waitUntil(timeout: 20) { item.status != .unknown }
+        print("HDR master status:", item.status.rawValue, String(describing: item.error))
+        #expect(item.status == .failed && DisplayRefusal.matches(item.error!))
+    }
+
     @MainActor
     @Test func assetReportsDisplayCriteria() async throws {
         let session = try await EnhancedPlaybackSession.start(url: source)

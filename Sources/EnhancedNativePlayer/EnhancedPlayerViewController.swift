@@ -14,7 +14,7 @@ import UIKit
 ///
 /// AVPlayerViewController must not be subclassed, so it is embedded as a child.
 /// On tvOS the display mode is matched to the stream before playback starts. An HDR
-/// file on a display that stays in SDR plays from `sdrMasterPlaylistURL`. Dismissing
+/// file whose master AVPlayer refuses for the display plays from `sdrMasterPlaylistURL`. Dismissing
 /// this controller ends playback, resets the display mode, stops the local server and
 /// deletes every cached segment.
 @MainActor
@@ -78,7 +78,7 @@ public final class EnhancedPlayerViewController: UIViewController {
                 self.session = session
                 try await self.matchDisplay(to: session)
                 guard !self.stopped else { return }
-                self.begin(session)
+                self.begin(session, master: session.masterPlaylistURL)
             } catch {
                 guard let self, !self.stopped, !(error is CancellationError) else { return }
                 self.onError?(error)
@@ -126,18 +126,10 @@ public final class EnhancedPlayerViewController: UIViewController {
         #endif
     }
 
-    /// Whether the display cannot show HDR right now. Checked after the mode switch.
-    /// `currentEDRHeadroom` also depends on whether EDR content is on screen, and
-    /// nothing is playing yet, so this reads the potential headroom.
-    private var displayIsSDR: Bool {
-        let headroom = view.window?.windowScene?.screen.potentialEDRHeadroom ?? 1
-        let eligible = AVPlayer.eligibleForHDRPlayback
-        Logger(label: "EnhancedNativePlayer").info("Display: potentialEDRHeadroom \(headroom), eligibleForHDRPlayback \(eligible)")
-        return !eligible || headroom <= 1
-    }
-
-    private func begin(_ session: EnhancedPlaybackSession) {
-        let master = session.isHDR && displayIsSDR ? session.sdrMasterPlaylistURL ?? session.masterPlaylistURL : session.masterPlaylistURL
+    /// tvOS cannot report the display's mode: `potentialEDRHeadroom` reads 1 in every mode
+    /// and `currentEDRHeadroom` stays at 1 for a while after HDR video. So an HDR file is
+    /// always offered its HDR master, and AVPlayer's refusal is what says the display is SDR.
+    private func begin(_ session: EnhancedPlaybackSession, master: URL) {
         let item = AVPlayerItem(url: master)
         let player = AVPlayer(playerItem: item)
         self.player = player
@@ -146,7 +138,13 @@ public final class EnhancedPlayerViewController: UIViewController {
         statusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
             Task { @MainActor [weak self] in
                 guard let self, !self.stopped else { return }
-                if item.status == .failed, let error = item.error {
+                guard self.player?.currentItem === item, item.status == .failed, let error = item.error else { return }
+                if master == session.masterPlaylistURL, let sdrMaster = session.sdrMasterPlaylistURL, DisplayRefusal.matches(error) {
+                    let nsError = error as NSError
+                    Logger(label: "EnhancedNativePlayer").info("HDR master refused (\(nsError.domain) \(nsError.code)), playing the SDR master")
+                    self.player?.pause()
+                    self.begin(session, master: sdrMaster)
+                } else {
                     self.onError?(error)
                 }
             }

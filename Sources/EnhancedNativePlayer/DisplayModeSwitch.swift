@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 
 enum DisplayModeSwitch {
@@ -20,5 +21,19 @@ enum DisplayModeSwitch {
             try await clock.sleep(for: poll)
         }
         try await clock.sleep(for: settle)
+    }
+}
+
+enum DisplayRefusal {
+    /// Whether an item failed because AVPlayer will not present this master on the current
+    /// display: no compatible alternates (-11868), the same for an HDR master on an SDR
+    /// display (-11848), or every variant filtered out when the master was parsed (-1002).
+    static func matches(_ error: Error) -> Bool {
+        let error = error as NSError
+        switch error.domain {
+        case AVFoundationErrorDomain: return error.code == -11868 || error.code == -11848
+        case NSURLErrorDomain: return error.code == NSURLErrorUnsupportedURL
+        default: return false
+        }
     }
 }
