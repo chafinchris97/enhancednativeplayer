@@ -78,6 +78,47 @@ struct FLACFrameHeaderTests {
         #expect(HLSRoute(fileName: "audio_1_init.mp4") == .audioInit(track: 1))
         #expect(HLSRoute(fileName: "audio_1_7.mp4") == .audioSegment(track: 1, index: 7))
         #expect(HLSRoute(fileName: "audio_x_7.mp4") == nil)
+        #expect(HLSRoute(fileName: "subtitle_2.m3u8") == .subtitlePlaylist(track: 2))
+        #expect(HLSRoute(fileName: "subtitle_2_30.vtt") == .subtitleSegment(track: 2, index: 30))
+        #expect(HLSRoute(fileName: "subtitle_2.vtt") == nil)
         #expect(HLSRoute(fileName: "other.ts") == nil)
+    }
+}
+
+struct WebVTTTests {
+    @Test func gridIsTenSecondsWithAShortLastSegment() {
+        let grid = SubtitleGrid(totalTicks: 255_000_000)
+        #expect(grid.count == 3)
+        #expect(grid.startTicks(of: 2) == 200_000_000)
+        #expect((0..<3).map(grid.duration) == [10, 10, 5.5])
+        #expect(SubtitleGrid(totalTicks: 200_000_000).count == 2)
+    }
+
+    @Test func documentShapeAndTimestamps() {
+        #expect(WebVTT.document([]) == "WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:900000,LOCAL:00:00:00.000\n")
+        let cue = SubtitleCue(startTicks: 36_610_123_456, endTicks: 36_620_000_000, text: "Hi", settings: "line:0")
+        #expect(WebVTT.document([cue]).hasSuffix("\n\n01:01:01.012 --> 01:01:02.000 line:0\nHi\n"))
+    }
+
+    @Test func subRipKeepsBasicTagsAndEscapes() {
+        let payload = Array("{\\an8}<font color=\"#fff\"><I>Tom & Jerry</I></font>\r\n\r\n1 < 2 --> 3\\Nend".utf8)
+        #expect(WebVTT.cueText(payload: payload, format: .subRip) == "<i>Tom &amp; Jerry</i>\n1 &lt; 2 --&gt; 3\nend")
+        #expect(WebVTT.cueText(payload: Array(" \r\n".utf8), format: .subRip) == nil)
+    }
+
+    @Test func subRipFallsBackToWindows1252() {
+        #expect(WebVTT.cueText(payload: [0x63, 0x61, 0x66, 0xE9], format: .subRip) == "café")
+    }
+
+    @Test func movTextReadsItsLengthAndDropsStyleBoxes() {
+        let text = Array("<Hi>".utf8)
+        let payload = [0, UInt8(text.count)] + text + [0, 0, 0, 12, 0x73, 0x74, 0x79, 0x6C, 0, 0, 0, 0]
+        #expect(WebVTT.cueText(payload: payload, format: .movText) == "&lt;Hi&gt;")
+        #expect(WebVTT.cueText(payload: [0, 0], format: .movText) == nil)
+    }
+
+    @Test func webVTTPayloadKeepsItsMarkup() {
+        #expect(WebVTT.cueText(payload: Array("<v Bob>Hi &amp; bye".utf8), format: .webVTT) == "<v Bob>Hi &amp; bye")
+        #expect(WebVTT.cueText(payload: Array("Tom & Jerry &lt;3".utf8), format: .webVTT) == "Tom &amp; Jerry &lt;3")
     }
 }

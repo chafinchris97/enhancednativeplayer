@@ -68,6 +68,7 @@ enum MediaProbe {
             bitRate: ctx.pointee.bit_rate > 0 ? ctx.pointee.bit_rate : nil,
             video: video,
             audio: audio,
+            subtitles: subtitleTracks(demuxer, usesDTS: usesDTS),
             keyframes: KeyframeIndex(
                 timestamps: timestamps,
                 positions: positions,
@@ -166,6 +167,34 @@ enum MediaProbe {
                 isAtmos: id == AV_CODEC_ID_EAC3 && par.pointee.profile == AV_PROFILE_EAC3_DDP_ATMOS,
                 delivery: copyable ? .copy : .flac,
                 extradata: par.extradataBytes
+            ))
+        }
+        return tracks
+    }
+
+    private static func subtitleTracks(_ demuxer: Demuxer, usesDTS: Bool) -> [SubtitleTrack] {
+        var tracks: [SubtitleTrack] = []
+        for i in 0..<demuxer.streamCount {
+            let stream = demuxer.stream(i)
+            let par = stream.codecpar
+            guard par.pointee.codec_type == AVMEDIA_TYPE_SUBTITLE else { continue }
+            var format: SubtitleTextFormat?
+            switch par.pointee.codec_id {
+            case AV_CODEC_ID_SUBRIP: format = .subRip
+            case AV_CODEC_ID_TEXT: format = .plainText
+            case AV_CODEC_ID_MOV_TEXT: format = .movText
+            // MP4's WebVTT samples are boxes, not cue text.
+            case AV_CODEC_ID_WEBVTT: format = usesDTS ? nil : .webVTT
+            default: break
+            }
+            tracks.append(SubtitleTrack(
+                index: tracks.count,
+                streamIndex: i,
+                codecName: codecName(par.pointee.codec_id),
+                timeBase: stream.timeBase,
+                language: stream.metadata("language").flatMap { $0 == "und" ? nil : $0 },
+                title: stream.metadata("title"),
+                textFormat: format
             ))
         }
         return tracks

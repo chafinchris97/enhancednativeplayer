@@ -24,6 +24,8 @@ public final class EnhancedPlaybackSession: Sendable {
     public let duration: TimeInterval
     /// The `NAME` of each audio rendition, in `audio_{n}` order.
     public let audioTrackNames: [String]
+    /// The `NAME` of each subtitle rendition, in `subtitle_{n}` order.
+    public let subtitleTrackNames: [String]
 
     private let core: PlaybackSessionCore
     private let server: HLSServer
@@ -36,6 +38,7 @@ public final class EnhancedPlaybackSession: Sendable {
         self.server = server
         self.duration = core.context.plan.segments.reduce(0) { $0 + $1.duration }
         self.audioTrackNames = core.playlists.audioNames()
+        self.subtitleTrackNames = core.playlists.subtitleNames()
     }
 
     public static func start(url: URL, configuration: EnhancedPlayerConfiguration = .init()) async throws -> EnhancedPlaybackSession {
@@ -71,7 +74,7 @@ public final class EnhancedPlaybackSession: Sendable {
                 hlsTime: configuration.segmentDuration,
                 end: media.videoEndTimestamp
             )
-            logger.info("Probed \(media.formatName) in \(String(format: "%.0f", Date().timeIntervalSince(started) * 1000)) ms: \(media.keyframes.timestamps.count) keyframes, \(plan.count) segments, \(media.audio.count) audio tracks")
+            logger.info("Probed \(media.formatName) in \(String(format: "%.0f", Date().timeIntervalSince(started) * 1000)) ms: \(media.keyframes.timestamps.count) keyframes, \(plan.count) segments, \(media.audio.count) audio tracks, \(media.subtitles.count) subtitle tracks")
             core = PlaybackSessionCore(
                 context: RemuxContext(file: file, media: media, plan: plan, token: token),
                 directory: directory,
@@ -114,13 +117,15 @@ final class PlaybackSessionCore: Sendable {
     private let sdrVideo: SegmentPipeline
     private let audio: SegmentPipeline
     private let inits = InitSegmentStore()
+    private let subtitleCues: SubtitleCueStore
     private let logger: Logger
 
     init(context: RemuxContext, directory: URL, segmentsAhead: Int, logger: Logger) {
         self.context = context
         self.directory = directory
         self.logger = logger
-        self.playlists = PlaylistBuilder(media: context.media, plan: context.plan)
+        self.playlists = PlaylistBuilder(media: context.media, plan: context.plan, subtitleGrid: context.subtitleGrid)
+        subtitleCues = SubtitleCueStore(context: context)
         video = SegmentPipeline(
             name: "video",
             directory: directory.appendingPathComponent("video", isDirectory: true),
@@ -200,6 +205,14 @@ final class PlaybackSessionCore: Sendable {
                 guard context.sdrRewriter != nil else { return Response(status: .notFound) }
                 checkTicks(runtimeTicks, index: index, file: fileName)
                 return try await serve(index, track: 0, from: sdrVideo, audio: false)
+            case .subtitlePlaylist(let track):
+                guard context.media.subtitles.indices.contains(track) else { return Response(status: .notFound) }
+                return .playlist(playlists.subtitlePlaylist(track: track))
+            case .subtitleSegment(let track, let index):
+                guard context.media.subtitles.indices.contains(track), (0..<context.subtitleGrid.count).contains(index) else { return Response(status: .notFound) }
+                let subtitle = context.media.subtitles[track]
+                guard let format = subtitle.textFormat else { return .webVTT(WebVTT.document([])) }
+                return .webVTT(WebVTT.document(try await subtitleCues.cues(track: subtitle, format: format, segment: index)))
             }
         } catch EnhancedPlayerError.segmentOutOfRange {
             return Response(status: .notFound)

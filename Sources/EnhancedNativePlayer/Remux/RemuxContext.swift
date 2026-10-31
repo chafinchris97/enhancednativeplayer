@@ -26,6 +26,7 @@ final class RemuxContext: Sendable {
     let file: RemoteFile
     let media: MediaInfo
     let plan: SegmentPlan
+    let subtitleGrid: SubtitleGrid
     let timeline: Timeline
     let token: CancellationToken
     /// Set when the video is HDR and can be relabeled for `master_sdr.m3u8`.
@@ -35,6 +36,7 @@ final class RemuxContext: Sendable {
         self.file = file
         self.media = media
         self.plan = plan
+        self.subtitleGrid = SubtitleGrid(totalTicks: plan.timeBase.rescaleNearest(plan.segments.last!.end - plan.origin, to: .ticks))
         self.token = token
         self.sdrRewriter = media.video.isHDR ? SDRBitstreamRewriter(codec: media.video.codec, extradata: media.video.extradata) : nil
         self.timeline = Timeline(videoTimeBase: media.keyframes.timeBase, originPresentation: plan.origin + presentationShift(media))

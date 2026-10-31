@@ -178,6 +178,101 @@ struct EndToEndTests {
         player.pause()
     }
 
+    /// A subtitle segment far into the file comes back with only its own stretch read,
+    /// even for a sparse track with no cue anywhere near it.
+    @Test func subtitleSegmentReadsOnlyItsStretch() async throws {
+        let cache = FileManager.default.temporaryDirectory.appendingPathComponent("enp-subtitle-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: cache) }
+        var configuration = EnhancedPlayerConfiguration()
+        configuration.cacheDirectory = cache
+        configuration.sourceCacheBytes = 64 << 40
+        let session = try await EnhancedPlaybackSession.start(url: source, configuration: configuration)
+        let base = session.masterPlaylistURL.deletingLastPathComponent()
+        var range = URLRequest(url: source)
+        range.setValue("bytes=0-0", forHTTPHeaderField: "Range")
+        let (_, response) = try await URLSession.shared.data(for: range)
+        let contentRange = try #require((response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Range"))
+        let fileBlocks = Int(contentRange.split(separator: "/").last!)! >> 20
+
+        func blocks() throws -> Set<String> {
+            Set(try FileManager.default.subpathsOfDirectory(atPath: cache.path).filter { $0.hasSuffix(".block") })
+        }
+        var before = try blocks()
+        let segment = Int(session.duration / 10) / 4
+        for track in session.subtitleTrackNames.indices {
+            let started = Date()
+            _ = try await data(base, "subtitle_\(track)_\(segment).vtt")
+            let read = try blocks().subtracting(before)
+            before.formUnion(read)
+            print("subtitle_\(track)_\(segment).vtt ready in \(Int(Date().timeIntervalSince(started) * 1000)) ms, \(read.count) of \(fileBlocks) blocks")
+            #expect(read.count <= max(12, fileBlocks / 4), "subtitle_\(track)_\(segment) read \(read.count) of \(fileBlocks) blocks")
+        }
+        await session.stop()
+    }
+
+    /// Files with text subtitles: a segment read straight after opening (no earlier
+    /// segments) has the cues a full pass finds, and AVPlayer shows a cue on time after a seek.
+    @MainActor
+    @Test func subtitleSegmentsAreRandomAccessAndReachAVPlayer() async throws {
+        let session = try await EnhancedPlaybackSession.start(url: source)
+        let base = session.masterPlaylistURL.deletingLastPathComponent()
+        let master = try await text(base, "master.m3u8")
+        try save("master.m3u8", Data(master.utf8))
+        #expect(master.components(separatedBy: "TYPE=SUBTITLES").count - 1 == session.subtitleTrackNames.count)
+
+        var target: (track: Int, seconds: Double, text: String)?
+        for track in session.subtitleTrackNames.indices {
+            let playlist = try await text(base, "subtitle_\(track).m3u8")
+            let names = playlist.split(separator: "\n").filter { $0.hasSuffix(".vtt") }
+            for name in names {
+                let started = Date()
+                let vtt = try await text(base, String(name))
+                try save(String(name), Data(vtt.utf8))
+                #expect(vtt.hasPrefix("WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:900000,LOCAL:00:00:00.000\n"))
+                let index = Int(name.split(separator: "_")[2].dropLast(4))!
+                let lines = vtt.components(separatedBy: "\n")
+                for (i, line) in lines.enumerated() where line.contains(" --> ") {
+                    let cueStart = Self.seconds(line.components(separatedBy: " --> ")[0])
+                    #expect(cueStart >= Double(index * 10) && cueStart < Double(index * 10 + 10), "\(name): cue at \(cueStart)")
+                    if target == nil, index >= names.count / 2 {
+                        target = (track, cueStart, lines[i + 1])
+                        print("\(name) ready in \(Int(Date().timeIntervalSince(started) * 1000)) ms")
+                    }
+                }
+            }
+        }
+        guard let target else {
+            await session.stop()
+            return
+        }
+
+        let item = AVPlayerItem(url: session.masterPlaylistURL)
+        let output = AVPlayerItemLegibleOutput()
+        let collector = CueCollector()
+        output.setDelegate(collector, queue: .main)
+        output.suppressesPlayerRendering = true
+        item.add(output)
+        let player = AVPlayer(playerItem: item)
+        player.isMuted = true
+        try await waitUntil(timeout: 20) { item.status != .unknown }
+        let group = try #require(try await item.asset.loadMediaSelectionGroup(for: .legible))
+        #expect(group.options.map(\.displayName) == session.subtitleTrackNames)
+        item.select(group.options[target.track], in: group)
+        let lead = max(0, target.seconds - 2)
+        await player.seek(to: CMTime(seconds: lead, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
+        player.play()
+        let wanted = target.text.replacingOccurrences(of: "<[^>]*>", with: "", options: .regularExpression)
+            .replacingOccurrences(of: "&lt;", with: "<")
+            .replacingOccurrences(of: "&gt;", with: ">")
+            .replacingOccurrences(of: "&amp;", with: "&")
+        try await waitUntil(timeout: 20) { collector.shown.contains { $0.text.contains(wanted) } }
+        let shown = collector.shown.first { $0.text.contains(wanted) }
+        print("cue \"\(wanted)\" at \(target.seconds) shown at", shown?.time ?? -1)
+        #expect(abs((shown?.time ?? -100) - target.seconds) < 0.5, "cue is off its time")
+        player.pause()
+        await session.stop()
+    }
+
     /// HDR sources only: `master_sdr.m3u8` announces SDR, its segments restart byte for
     /// byte, and AVPlayer plays it with no HDR transfer function on the track.
     @MainActor
@@ -240,6 +335,10 @@ struct EndToEndTests {
 
     // MARK: - Helpers
 
+    static func seconds(_ timestamp: String) -> Double {
+        timestamp.split(separator: ":").reduce(0) { $0 * 60 + Double($1)! }
+    }
+
     /// tfdt and the trun sample durations of a one-fragment segment.
     static func timing(_ data: Data) -> [UInt64] {
         let bytes = [UInt8](data)
@@ -285,6 +384,15 @@ struct EndToEndTests {
             try await Task.sleep(for: .milliseconds(200))
         }
         Issue.record("timed out after \(timeout) s")
+    }
+}
+
+/// What AVPlayer renders for the selected subtitle rendition.
+final class CueCollector: NSObject, AVPlayerItemLegibleOutputPushDelegate, @unchecked Sendable {
+    var shown: [(text: String, time: Double)] = []
+
+    func legibleOutput(_ output: AVPlayerItemLegibleOutput, didOutputAttributedStrings strings: [NSAttributedString], nativeSampleBuffers: [Any], forItemTime itemTime: CMTime) {
+        shown += strings.map { ($0.string, itemTime.seconds) }
     }
 }
 

@@ -1,12 +1,14 @@
 import Foundation
 
-/// Builds `master.m3u8`, `video.m3u8` and `audio_{n}.m3u8` from the probe and the plan,
-/// plus `master_sdr.m3u8` and `video_sdr.m3u8` for the relabeled video of an HDR file.
+/// Builds `master.m3u8`, `video.m3u8`, `audio_{n}.m3u8` and `subtitle_{n}.m3u8` from the
+/// probe and the plan, plus `master_sdr.m3u8` and `video_sdr.m3u8` for the relabeled video of an HDR file.
 struct PlaylistBuilder: Sendable {
     let media: MediaInfo
     let plan: SegmentPlan
+    let subtitleGrid: SubtitleGrid
 
     static let audioGroup = "audio"
+    static let subtitleGroup = "subtitles"
 
     // MARK: Master
 
@@ -32,6 +34,23 @@ struct PlaylistBuilder: Sendable {
         }
         if !media.audio.isEmpty { lines.append("") }
 
+        let subtitleNames = subtitleNames()
+        for track in media.subtitles {
+            // The label goes in both, as for audio. Off until chosen: Matroska's default flag is on unless a
+            // muxer clears it. No FORCED either, since the menu hides forced renditions.
+            let attributes = [
+                "TYPE=SUBTITLES",
+                "GROUP-ID=\"\(Self.subtitleGroup)\"",
+                "NAME=\"\(subtitleNames[track.index])\"",
+                "LANGUAGE=\"\(subtitleNames[track.index])\"",
+                "AUTOSELECT=YES",
+                "DEFAULT=NO",
+                "URI=\"subtitle_\(track.index).m3u8\"",
+            ]
+            lines.append("#EXT-X-MEDIA:" + attributes.joined(separator: ","))
+        }
+        if !media.subtitles.isEmpty { lines.append("") }
+
         let video = sdr ? media.video.sdrVariant : media.video
         let audioCodecs = uniqued(media.audio.map(CodecStrings.audio))
         let (peak, average) = bandwidth()
@@ -46,6 +65,7 @@ struct PlaylistBuilder: Sendable {
             if let rate = video.frameRate { attributes.append("FRAME-RATE=\(String(format: "%.3f", rate))") }
             attributes.append("VIDEO-RANGE=\(range.rawValue)")
             if !media.audio.isEmpty { attributes.append("AUDIO=\"\(Self.audioGroup)\"") }
+            if !media.subtitles.isEmpty { attributes.append("SUBTITLES=\"\(Self.subtitleGroup)\"") }
             attributes.append("CLOSED-CAPTIONS=NONE")
             lines.append("#EXT-X-STREAM-INF:" + attributes.joined(separator: ","))
             lines.append(sdr ? "video_sdr.m3u8" : "video.m3u8")
@@ -75,6 +95,23 @@ struct PlaylistBuilder: Sendable {
         mediaPlaylist(map: "audio_\(track)_init.mp4") { "audio_\(track)_\($0).mp4" }
     }
 
+    /// Subtitles have their own fixed 10 s segments, independent of the video cuts.
+    func subtitlePlaylist(track: Int) -> String {
+        var lines = [
+            "#EXTM3U",
+            "#EXT-X-VERSION:7",
+            "#EXT-X-TARGETDURATION:\(SubtitleGrid.segmentTicks / 10_000_000)",
+            "#EXT-X-MEDIA-SEQUENCE:0",
+            "#EXT-X-PLAYLIST-TYPE:VOD",
+        ]
+        for index in 0..<subtitleGrid.count {
+            lines.append(String(format: "#EXTINF:%f,", subtitleGrid.duration(of: index)))
+            lines.append("subtitle_\(track)_\(index).vtt")
+        }
+        lines.append("#EXT-X-ENDLIST")
+        return lines.joined(separator: "\n") + "\n"
+    }
+
     /// Audio segments use the video cuts, so both playlists share every EXTINF.
     private func mediaPlaylist(map: String, segmentName: (Int) -> String) -> String {
         var lines = [
@@ -97,13 +134,22 @@ struct PlaylistBuilder: Sendable {
 
     /// `{Language} - {Track Title} - {Codec}`, unique within the group as HLS requires.
     func audioNames() -> [String] {
+        uniqueNames(media.audio.map { ($0.language, $0.title, codecLabel($0)) })
+    }
+
+    /// `{Language} - {Codec}`. Subtitle titles are often just the language again.
+    func subtitleNames() -> [String] {
+        uniqueNames(media.subtitles.map { ($0.language, nil, codecLabel($0)) })
+    }
+
+    private func uniqueNames(_ tracks: [(language: String?, title: String?, codec: String)]) -> [String] {
         var seen: [String: Int] = [:]
-        return media.audio.map { track in
+        return tracks.map { track in
             var parts = [track.language.flatMap(Languages.displayName) ?? "Unknown"]
             if let title = track.title?.trimmingCharacters(in: .whitespaces), !title.isEmpty {
                 parts.append(title)
             }
-            parts.append(codecLabel(track))
+            parts.append(track.codec)
             var name = parts.joined(separator: " - ").replacingOccurrences(of: "\"", with: "'")
             let count = seen[name, default: 0]
             seen[name] = count + 1
@@ -122,6 +168,19 @@ struct PlaylistBuilder: Sendable {
         case "ac3": return "AC3"
         case "eac3": return track.isAtmos ? "EAC3 Atmos" : "EAC3"
         case "flac": return "FLAC"
+        default: return track.codecName.uppercased()
+        }
+    }
+
+    func codecLabel(_ track: SubtitleTrack) -> String {
+        switch track.codecName {
+        case "subrip": return "SRT"
+        case "mov_text": return "TX3G"
+        case "webvtt": return "WebVTT"
+        case "text": return "Text"
+        case "hdmv_pgs_subtitle": return "PGS"
+        case "dvd_subtitle": return "VobSub"
+        case "dvb_subtitle": return "DVB"
         default: return track.codecName.uppercased()
         }
     }

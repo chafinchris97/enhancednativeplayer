@@ -100,6 +100,26 @@ struct AudioTrack: Sendable {
     var deliveredChannels: Int { delivery == .flac ? min(channels, 8) : channels }
 }
 
+/// How a subtitle codec's packets turn into WebVTT cue text.
+enum SubtitleTextFormat: Sendable, Equatable {
+    case subRip
+    case plainText
+    case movText
+    case webVTT
+}
+
+struct SubtitleTrack: Sendable {
+    /// Position among the file's subtitle tracks, the `{index}` in `subtitle_{index}.m3u8`.
+    var index: Int
+    var streamIndex: Int32
+    var codecName: String
+    var timeBase: Rational
+    var language: String?
+    var title: String?
+    /// Nil for ASS and bitmap subtitles, whose segments stay empty for now.
+    var textFormat: SubtitleTextFormat?
+}
+
 /// Every video keyframe of the file, read from the container index.
 struct KeyframeIndex: Sendable {
     /// Keyframe timestamps in the video time base, ascending.
@@ -122,6 +142,7 @@ struct MediaInfo: Sendable {
     var bitRate: Int64?
     var video: VideoTrack
     var audio: [AudioTrack]
+    var subtitles: [SubtitleTrack]
     var keyframes: KeyframeIndex
     /// End of the video stream in index timestamps.
     var videoEndTimestamp: Int64
