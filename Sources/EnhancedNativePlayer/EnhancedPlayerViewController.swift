@@ -31,6 +31,7 @@ public final class EnhancedPlayerViewController: UIViewController {
     private var startTask: Task<Void, Never>?
     private var statusObservation: NSKeyValueObservation?
     private var stopped = false
+    private var audioSessionActive = false
     #if os(tvOS)
     /// Kept because the view has no window any more by the time it has disappeared.
     private var displayManager: AVDisplayManager?
@@ -78,6 +79,7 @@ public final class EnhancedPlayerViewController: UIViewController {
                 self.session = session
                 try await self.matchDisplay(to: session)
                 guard !self.stopped else { return }
+                self.activateAudioSession()
                 self.begin(session, master: session.masterPlaylistURL)
             } catch {
                 guard let self, !self.stopped, !(error is CancellationError) else { return }
@@ -102,6 +104,10 @@ public final class EnhancedPlayerViewController: UIViewController {
         player?.pause()
         player?.replaceCurrentItem(with: nil)
         playerViewController.player = nil
+        if audioSessionActive {
+            audioSessionActive = false
+            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        }
         #if os(tvOS)
         displayManager?.preferredDisplayCriteria = nil
         displayManager = nil
@@ -124,6 +130,19 @@ public final class EnhancedPlayerViewController: UIViewController {
         guard manager.isDisplayCriteriaMatchingEnabled else { return }
         try await DisplayModeSwitch.wait(isSwitching: { manager.isDisplayModeSwitchInProgress })
         #endif
+    }
+
+    /// tvOS offers Enhance Dialogue only in the `moviePlayback` mode. A failure here costs
+    /// that option, not the movie, so playback goes ahead without it.
+    private func activateAudioSession() {
+        do {
+            let audioSession = AVAudioSession.sharedInstance()
+            try audioSession.setCategory(.playback, mode: .moviePlayback)
+            try audioSession.setActive(true)
+            audioSessionActive = true
+        } catch {
+            Logger(label: "EnhancedNativePlayer").warning("Audio session not activated: \(error)")
+        }
     }
 
     /// tvOS cannot report the display's mode: `potentialEDRHeadroom` reads 1 in every mode
