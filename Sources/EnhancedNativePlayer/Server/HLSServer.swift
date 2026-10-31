@@ -2,6 +2,7 @@ import Foundation
 import Hummingbird
 import Logging
 import NIOCore
+import NIOTransportServices
 import ServiceLifecycle
 
 /// The local HTTP server AVPlayer talks to. Every playlist and segment is a route;
@@ -34,6 +35,8 @@ final class HLSServer: Sendable {
                 continuation.yield(channel.localAddress?.port ?? 0)
                 continuation.finish()
             },
+            // Hummingbird's .singleton only picks Network.framework on iOS, not tvOS.
+            eventLoopGroupProvider: .shared(NIOTSEventLoopGroup.singleton),
             logger: logger
         )
         let group = ServiceGroup(configuration: .init(services: [app], logger: logger))
@@ -92,10 +95,12 @@ enum HLSRoute: Equatable {
     case sdrVideoPlaylist
     case sdrVideoInit
     case sdrVideoSegment(Int)
+    case subtitlePlaylist(track: Int)
+    case subtitleSegment(track: Int, index: Int)
 
     /// master.m3u8, video.m3u8, audio_{t}.m3u8, init_video.mp4, video_{n}.mp4,
     /// audio_{t}_init.mp4, audio_{t}_{n}.mp4, master_sdr.m3u8, video_sdr.m3u8,
-    /// init_video_sdr.mp4, video_sdr_{n}.mp4
+    /// init_video_sdr.mp4, video_sdr_{n}.mp4, subtitle_{t}.m3u8, subtitle_{t}_{n}.vtt
     init?(fileName: String) {
         switch fileName {
         case "master.m3u8": self = .master
@@ -107,6 +112,12 @@ enum HLSRoute: Equatable {
         default:
             if let stem = fileName.dropSuffix(".m3u8"), let track = stem.dropPrefix("audio_").flatMap({ Int($0) }) {
                 self = .audioPlaylist(track: track)
+            } else if let stem = fileName.dropSuffix(".m3u8"), let track = stem.dropPrefix("subtitle_").flatMap({ Int($0) }) {
+                self = .subtitlePlaylist(track: track)
+            } else if let rest = fileName.dropSuffix(".vtt")?.dropPrefix("subtitle_") {
+                let parts = rest.split(separator: "_")
+                guard parts.count == 2, let track = Int(parts[0]), let index = Int(parts[1]) else { return nil }
+                self = .subtitleSegment(track: track, index: index)
             } else if let stem = fileName.dropSuffix(".mp4") {
                 if let index = stem.dropPrefix("video_sdr_").flatMap({ Int($0) }) {
                     self = .sdrVideoSegment(index)
@@ -147,6 +158,14 @@ extension Response {
         Response(
             status: .ok,
             headers: [.contentType: "application/vnd.apple.mpegurl", .cacheControl: "no-cache"],
+            body: ResponseBody(byteBuffer: ByteBuffer(string: text))
+        )
+    }
+
+    static func webVTT(_ text: String) -> Response {
+        Response(
+            status: .ok,
+            headers: [.contentType: "text/vtt"],
             body: ResponseBody(byteBuffer: ByteBuffer(string: text))
         )
     }
