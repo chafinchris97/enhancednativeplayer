@@ -11,12 +11,14 @@ func openAudioDemuxer(context: RemuxContext, track: AudioTrack, start: Int, toke
     let demuxer = try Demuxer(file: context.file, token: token, findStreamInfo: false)
     demuxer.discardAll(except: [track.streamIndex])
     if start > 0 {
-        let videoTB = context.media.video.timeBase
-        let first = videoTB.rescale(context.presentationStart(of: 0), to: .microseconds)
-        let boundary = videoTB.rescale(context.presentationStart(of: start), to: .microseconds)
-        let target = max(first, boundary - 1_000_000)
-        // stream -1 seeks on the default (video) stream's index, in AV_TIME_BASE.
-        try FF.check(av_seek_frame(demuxer.formatContext, -1, target, AVSEEK_FLAG_BACKWARD), "av_seek_frame(audio)")
+        let video = context.media.video
+        let first = context.presentationStart(of: 0)
+        let boundary = context.presentationStart(of: start)
+        let target = max(first, boundary - Rational.microseconds.rescale(1_000_000, to: video.timeBase))
+        // Seek on the video stream by name, since its index is the keyframe index. Stream
+        // -1 would pick this demuxer's only undiscarded stream, the audio, which has no
+        // Matroska Cues, and libavformat would then read the file from the start to get there.
+        try demuxer.seek(stream: video.streamIndex, timestamp: target)
     }
     return demuxer
 }

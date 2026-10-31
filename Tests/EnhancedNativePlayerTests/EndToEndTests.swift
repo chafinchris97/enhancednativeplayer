@@ -99,6 +99,42 @@ struct EndToEndTests {
         }
     }
 
+    /// A seek must read the file around its target, not everything before it. Every
+    /// block a session fetches lands in the cache, so the cache shows what was read.
+    @Test func seekReadsOnlyAroundItsTarget() async throws {
+        let cache = FileManager.default.temporaryDirectory.appendingPathComponent("enp-seek-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: cache) }
+        var configuration = EnhancedPlayerConfiguration()
+        configuration.cacheDirectory = cache
+        configuration.sourceCacheBytes = 64 << 40
+        let session = try await EnhancedPlaybackSession.start(url: source, configuration: configuration)
+        let base = session.masterPlaylistURL.deletingLastPathComponent()
+        let extinf = try await text(base, "video.m3u8").split(separator: "\n").filter { $0.hasPrefix("#EXTINF") }
+        let middle = extinf.count / 2
+
+        func blocks() throws -> [Int] {
+            try FileManager.default.subpathsOfDirectory(atPath: cache.path)
+                .filter { $0.hasSuffix(".block") }
+                .compactMap { Int((($0 as NSString).lastPathComponent as NSString).deletingPathExtension) }
+        }
+        let beforeSeek = Set(try blocks())
+
+        var names = ["video_\(middle).mp4"]
+        names += session.audioTrackNames.indices.map { "audio_\($0)_\(middle).mp4" }
+        for name in names {
+            let started = Date()
+            _ = try await data(base, name)
+            print("\(name) ready in \(Int(Date().timeIntervalSince(started) * 1000)) ms")
+        }
+
+        let read = Set(try blocks()).subtracting(beforeSeek)
+        let highest = read.max() ?? 0
+        let skippedOver = read.filter { $0 < highest / 2 }
+        print("seek read \(read.count) blocks; \(skippedOver.count) from the first half of the range read")
+        #expect(skippedOver.count < 16, "seeking to segment \(middle) read \(skippedOver.count) blocks far before it")
+        await session.stop()
+    }
+
     @MainActor
     @Test func avPlayerPlaysAndSeeks() async throws {
         let session = try await EnhancedPlaybackSession.start(url: source)

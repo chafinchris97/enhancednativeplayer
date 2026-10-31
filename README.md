@@ -74,6 +74,7 @@ The end-to-end suite checks:
 
 - probe speed and EXTINF parity with ffmpeg
 - byte-identical segments between a continuous run and restarted runs, for video and every audio track
+- a seek reads only the file around its target, for video and every audio track
 - the 3-segment window and delete-after-send
 - cleanup on stop
 - real AVPlayer playback, seeking and audio-track switching
