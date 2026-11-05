@@ -38,8 +38,10 @@ struct PlaylistBuilder: Sendable {
         let subtitleLanguages = subtitleLanguages()
         // Matroska's default flag is on unless a muxer clears it, so when every track
         // carries it nobody chose one and subtitles start off.
-        let flaggedDefault = media.subtitles.filter(\.isDefault)
-        let defaultSubtitle = flaggedDefault.count == media.subtitles.count && media.subtitles.count > 1
+        // Forced tracks are never the default: they turn on with their audio's language instead.
+        let flaggedDefault = media.subtitles.filter { $0.isDefault && !$0.isForced }
+        let unforced = media.subtitles.filter { !$0.isForced }.count
+        let defaultSubtitle = flaggedDefault.count == unforced && unforced > 1
             ? nil : flaggedDefault.first?.index
         for track in media.subtitles {
             let attributes = [
@@ -48,7 +50,6 @@ struct PlaylistBuilder: Sendable {
                 "NAME=\"\(subtitleNames[track.index])\"",
                 "LANGUAGE=\"\(subtitleLanguages[track.index])\"",
                 "DEFAULT=\(track.index == defaultSubtitle ? "YES" : "NO")",
-                "FORCED=\(track.isForced ? "YES" : "NO")",
                 "URI=\"subtitle_\(track.index).m3u8\"",
             ]
             lines.append("#EXT-X-MEDIA:" + attributes.joined(separator: ","))
@@ -142,8 +143,7 @@ struct PlaylistBuilder: Sendable {
     }
 
     /// `{Language}`, then `{Language} ({n})` for later tracks of the same language, n counting
-    /// its non-forced tracks. The menu hides forced renditions, so they are `{Language} (Forced)`
-    /// on their own count and never push a visible track to "(2)". Unique, as HLS requires.
+    /// its non-forced tracks. Forced tracks are `{Language} (Forced)` on their own count. Unique, as HLS requires.
     func subtitleNames() -> [String] {
         var counts: [String: Int] = [:]
         return media.subtitles.map { track in
@@ -155,16 +155,16 @@ struct PlaylistBuilder: Sendable {
         }
     }
 
-    /// LANGUAGE for each subtitle track. The first non-forced track of a language, and every forced
-    /// one, gets the real tag so the menu and the system's language preference see the language.
-    /// The menu labels an option from LANGUAGE alone, so later tracks of the same language, and a
-    /// track with no known language, carry their NAME instead to stay apart.
+    /// LANGUAGE for each subtitle track. The first non-forced track of a language gets the real tag
+    /// so the menu and the system's language preference see the language. The menu labels an option
+    /// from LANGUAGE alone, so forced tracks, later tracks of the same language, and a track with no
+    /// known language carry their NAME instead to stay apart. No rendition is marked FORCED: AVPlayer
+    /// would only show one when the audio's LANGUAGE matched, and audio LANGUAGE is a label, not a tag.
     func subtitleLanguages() -> [String] {
         let names = subtitleNames()
         var taken = Set<String>()
         return media.subtitles.map { track in
-            guard let tag = track.language.flatMap(Languages.tag) else { return names[track.index] }
-            if track.isForced { return tag }
+            guard !track.isForced, let tag = track.language.flatMap(Languages.tag) else { return names[track.index] }
             return taken.insert(tag).inserted ? tag : names[track.index]
         }
     }

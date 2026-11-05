@@ -106,6 +106,23 @@ public final class EnhancedPlaybackSession: Sendable {
         return track
     }
 
+    /// The forced subtitle rendition for the language of an audio rendition, by name.
+    func forcedSubtitleName(forAudioNamed name: String) -> String? {
+        let media = core.context.media
+        guard let audio = audioTrackNames.firstIndex(of: name),
+              let language = media.audio[audio].language.flatMap(Languages.tag),
+              let track = media.subtitles.first(where: { $0.isForced && $0.language.flatMap(Languages.tag) == language })
+        else { return nil }
+        return subtitleTrackNames[track.index]
+    }
+
+    func isForcedSubtitle(named name: String) -> Bool {
+        guard let track = subtitleTrackNames.firstIndex(of: name) else { return false }
+        return core.context.media.subtitles[track].isForced
+    }
+
+    var hasForcedSubtitles: Bool { core.context.media.subtitles.contains(where: \.isForced) }
+
     var hasPGSTracks: Bool { core.context.media.subtitles.contains(where: \.isPGS) }
 
     /// The subtitle segment holding a position in the playlist timeline.

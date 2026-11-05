@@ -33,6 +33,7 @@ public final class EnhancedPlayerViewController: UIViewController {
     private var waitingObservation: NSKeyValueObservation?
     private var errorLogObserver: NSObjectProtocol?
     private var pgsRenderer: PGSSubtitleRenderer?
+    private var forcedSubtitles: ForcedSubtitleSelector?
     private var stopped = false
     private var audioSessionActive = false
     #if os(tvOS)
@@ -112,6 +113,8 @@ public final class EnhancedPlayerViewController: UIViewController {
         errorLogObserver = nil
         pgsRenderer?.stop()
         pgsRenderer = nil
+        forcedSubtitles?.stop()
+        forcedSubtitles = nil
         player?.pause()
         player?.replaceCurrentItem(with: nil)
         playerViewController.player = nil
@@ -181,6 +184,8 @@ public final class EnhancedPlayerViewController: UIViewController {
         let player = AVPlayer(playerItem: item)
         self.player = player
         playerViewController.player = player
+        forcedSubtitles?.stop()
+        forcedSubtitles = session.hasForcedSubtitles ? ForcedSubtitleSelector(session: session, item: item) : nil
         if session.hasPGSTracks, let overlay = playerViewController.contentOverlayView {
             let renderer = pgsRenderer ?? PGSSubtitleRenderer(session: session, container: overlay)
             pgsRenderer = renderer
