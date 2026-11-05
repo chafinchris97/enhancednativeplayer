@@ -35,16 +35,20 @@ struct PlaylistBuilder: Sendable {
         if !media.audio.isEmpty { lines.append("") }
 
         let subtitleNames = subtitleNames()
+        let subtitleLanguages = subtitleLanguages()
+        // Matroska's default flag is on unless a muxer clears it, so when every track
+        // carries it nobody chose one and subtitles start off.
+        let flaggedDefault = media.subtitles.filter(\.isDefault)
+        let defaultSubtitle = flaggedDefault.count == media.subtitles.count && media.subtitles.count > 1
+            ? nil : flaggedDefault.first?.index
         for track in media.subtitles {
-            // The label goes in both, as for audio. Off until chosen: Matroska's default flag is on unless a
-            // muxer clears it. No FORCED either, since the menu hides forced renditions.
             let attributes = [
                 "TYPE=SUBTITLES",
                 "GROUP-ID=\"\(Self.subtitleGroup)\"",
                 "NAME=\"\(subtitleNames[track.index])\"",
-                "LANGUAGE=\"\(subtitleNames[track.index])\"",
-                "AUTOSELECT=YES",
-                "DEFAULT=NO",
+                "LANGUAGE=\"\(subtitleLanguages[track.index])\"",
+                "DEFAULT=\(track.index == defaultSubtitle ? "YES" : "NO")",
+                "FORCED=\(track.isForced ? "YES" : "NO")",
                 "URI=\"subtitle_\(track.index).m3u8\"",
             ]
             lines.append("#EXT-X-MEDIA:" + attributes.joined(separator: ","))
@@ -137,9 +141,32 @@ struct PlaylistBuilder: Sendable {
         uniqueNames(media.audio.map { ($0.language, $0.title, codecLabel($0)) })
     }
 
-    /// `{Language} - {Codec}`. Subtitle titles are often just the language again.
+    /// `{Language}`, then `{Language} ({n})` for later tracks of the same language, n counting
+    /// its non-forced tracks. The menu hides forced renditions, so they are `{Language} (Forced)`
+    /// on their own count and never push a visible track to "(2)". Unique, as HLS requires.
     func subtitleNames() -> [String] {
-        uniqueNames(media.subtitles.map { ($0.language, nil, codecLabel($0)) })
+        var counts: [String: Int] = [:]
+        return media.subtitles.map { track in
+            let language = track.language.flatMap(Languages.displayName) ?? "Unknown"
+            let base = track.isForced ? "\(language) (Forced)" : language
+            let count = counts[base, default: 0] + 1
+            counts[base] = count
+            return count == 1 ? base : "\(base) (\(count))"
+        }
+    }
+
+    /// LANGUAGE for each subtitle track. The first non-forced track of a language, and every forced
+    /// one, gets the real tag so the menu and the system's language preference see the language.
+    /// The menu labels an option from LANGUAGE alone, so later tracks of the same language, and a
+    /// track with no known language, carry their NAME instead to stay apart.
+    func subtitleLanguages() -> [String] {
+        let names = subtitleNames()
+        var taken = Set<String>()
+        return media.subtitles.map { track in
+            guard let tag = track.language.flatMap(Languages.tag) else { return names[track.index] }
+            if track.isForced { return tag }
+            return taken.insert(tag).inserted ? tag : names[track.index]
+        }
     }
 
     private func uniqueNames(_ tracks: [(language: String?, title: String?, codec: String)]) -> [String] {
@@ -168,19 +195,6 @@ struct PlaylistBuilder: Sendable {
         case "ac3": return "AC3"
         case "eac3": return track.isAtmos ? "EAC3 Atmos" : "EAC3"
         case "flac": return "FLAC"
-        default: return track.codecName.uppercased()
-        }
-    }
-
-    func codecLabel(_ track: SubtitleTrack) -> String {
-        switch track.codecName {
-        case "subrip": return "SRT"
-        case "mov_text": return "TX3G"
-        case "webvtt": return "WebVTT"
-        case "text": return "Text"
-        case "hdmv_pgs_subtitle": return "PGS"
-        case "dvd_subtitle": return "VobSub"
-        case "dvb_subtitle": return "DVB"
         default: return track.codecName.uppercased()
         }
     }
@@ -226,6 +240,13 @@ enum Languages {
     private static func normalized(_ code: String) -> String {
         let lower = code.lowercased()
         return bibliographic[lower] ?? lower
+    }
+
+    /// The BCP 47 tag for a Matroska / MP4 code: the two-letter form when there is one ("eng" → "en").
+    static func tag(_ code: String) -> String? {
+        let language = Locale.LanguageCode(normalized(code))
+        guard language.isISOLanguage else { return nil }
+        return language.identifier(.alpha2) ?? language.identifier
     }
 
     static func displayName(_ code: String) -> String? {

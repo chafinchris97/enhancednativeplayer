@@ -194,6 +194,8 @@ enum MediaProbe {
                 timeBase: stream.timeBase,
                 language: stream.metadata("language").flatMap { $0 == "und" ? nil : $0 },
                 title: stream.metadata("title"),
+                isDefault: stream.pointee.disposition & AV_DISPOSITION_DEFAULT != 0,
+                isForced: stream.pointee.disposition & AV_DISPOSITION_FORCED != 0,
                 textFormat: format
             ))
         }

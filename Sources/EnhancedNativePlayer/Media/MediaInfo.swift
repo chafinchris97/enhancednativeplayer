@@ -116,6 +116,8 @@ struct SubtitleTrack: Sendable {
     var timeBase: Rational
     var language: String?
     var title: String?
+    var isDefault: Bool
+    var isForced: Bool
     /// Nil for ASS and bitmap subtitles, whose segments stay empty for now.
     var textFormat: SubtitleTextFormat?
 }
