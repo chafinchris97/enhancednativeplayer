@@ -256,31 +256,63 @@ struct DisplayRefusalTests {
 
 @MainActor
 struct DisplayModeSwitchTests {
+    /// Plays `script` (time since the start of the wait → event) as the notifications seen so far.
+    private func timeline(_ script: [(Duration, DisplayModeSwitch.Event)]) -> () -> [DisplayModeSwitch.Event] {
+        let clock = ContinuousClock()
+        let begin = clock.now
+        return { script.filter { begin.duration(to: clock.now) >= $0.0 }.map(\.1) }
+    }
+
     @Test func returnsAfterTheTimeoutWhenNoSwitchStarts() async throws {
         let clock = ContinuousClock()
+        var outcome: DisplayModeSwitch.Outcome?
         let elapsed = try await clock.measure {
-            try await DisplayModeSwitch.wait(isSwitching: { false }, startTimeout: .milliseconds(100), settle: .seconds(60), poll: .milliseconds(5))
+            outcome = try await DisplayModeSwitch.wait(events: { [] }, startTimeout: .milliseconds(100), settle: .seconds(60), poll: .milliseconds(5))
         }
+        #expect(outcome == .neverStarted)
         #expect(elapsed >= .milliseconds(100) && elapsed < .seconds(30))
     }
 
     @Test func waitsForTheEndOfTheSwitchPlusSettle() async throws {
         let clock = ContinuousClock()
-        let begin = clock.now
+        let events = timeline([(.milliseconds(50), .started), (.milliseconds(150), .ended)])
+        var outcome: DisplayModeSwitch.Outcome?
         let elapsed = try await clock.measure {
-            try await DisplayModeSwitch.wait(
-                isSwitching: { let t = begin.duration(to: clock.now); return t > .milliseconds(50) && t < .milliseconds(150) },
-                startTimeout: .seconds(60),
-                settle: .milliseconds(100),
-                poll: .milliseconds(5)
-            )
+            outcome = try await DisplayModeSwitch.wait(events: events, startTimeout: .seconds(60), settle: .milliseconds(100), poll: .milliseconds(5))
         }
+        #expect(outcome == .switched)
         #expect(elapsed >= .milliseconds(250) && elapsed < .seconds(30))
+    }
+
+    @Test func aSecondSwitchDuringTheSettleIsWaitedFor() async throws {
+        let clock = ContinuousClock()
+        let events = timeline([(.milliseconds(20), .started), (.milliseconds(60), .ended), (.milliseconds(100), .started), (.milliseconds(300), .ended)])
+        var outcome: DisplayModeSwitch.Outcome?
+        let elapsed = try await clock.measure {
+            outcome = try await DisplayModeSwitch.wait(events: events, startTimeout: .seconds(60), settle: .milliseconds(100), poll: .milliseconds(5))
+        }
+        #expect(outcome == .switched)
+        #expect(elapsed >= .milliseconds(400) && elapsed < .seconds(30))
+    }
+
+    @Test func anEndWithoutAStartCountsAsASwitch() async throws {
+        let outcome = try await DisplayModeSwitch.wait(events: timeline([(.milliseconds(20), .ended)]), startTimeout: .seconds(60), settle: .milliseconds(20), poll: .milliseconds(5))
+        #expect(outcome == .switched)
+    }
+
+    @Test func givesUpOnASwitchThatNeverEnds() async throws {
+        let clock = ContinuousClock()
+        var outcome: DisplayModeSwitch.Outcome?
+        let elapsed = try await clock.measure {
+            outcome = try await DisplayModeSwitch.wait(events: { [.started] }, switchTimeout: .milliseconds(100), settle: .seconds(60), poll: .milliseconds(5))
+        }
+        #expect(outcome == .neverEnded)
+        #expect(elapsed >= .milliseconds(100) && elapsed < .seconds(30))
     }
 
     @Test func cancellationEndsTheWait() async {
         let task = Task { @MainActor in
-            try await DisplayModeSwitch.wait(isSwitching: { true }, poll: .milliseconds(5))
+            try await DisplayModeSwitch.wait(events: { [.started] }, poll: .milliseconds(5))
         }
         task.cancel()
         await #expect(throws: CancellationError.self) { try await task.value }

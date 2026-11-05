@@ -1,4 +1,5 @@
 import Foundation
+import Logging
 
 /// Random access to a remote file through HTTP range requests.
 ///
@@ -16,6 +17,7 @@ final class RemoteFile: @unchecked Sendable {
     private let session: URLSession
     private let headers: [String: String]
     private let directory: URL
+    private let logger: Logger
     private let maxDiskBlocks: Int
     private let maxMemoryBlocks = 16
     private let maxConcurrentFetches = 6
@@ -29,20 +31,21 @@ final class RemoteFile: @unchecked Sendable {
     private var failures: [Int: Error] = [:]
     private var closed = false
 
-    private init(url: URL, length: Int64, blockSize: Int, session: URLSession, headers: [String: String], directory: URL, diskBudget: Int64) {
+    private init(url: URL, length: Int64, blockSize: Int, session: URLSession, headers: [String: String], directory: URL, diskBudget: Int64, logger: Logger) {
         self.url = url
         self.length = length
         self.blockSize = blockSize
         self.session = session
         self.headers = headers
         self.directory = directory
+        self.logger = logger
         self.maxDiskBlocks = max(0, Int(diskBudget / Int64(blockSize)))
     }
 
     var blockCount: Int { Int((length + Int64(blockSize) - 1) / Int64(blockSize)) }
 
     /// Opens the file with a range request for the first block, which also yields its length.
-    static func open(url: URL, headers: [String: String], directory: URL, blockSize: Int = 1 << 20, diskBudget: Int64) async throws -> RemoteFile {
+    static func open(url: URL, headers: [String: String], directory: URL, blockSize: Int = 1 << 20, diskBudget: Int64, logger: Logger = .player) async throws -> RemoteFile {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let configuration = URLSessionConfiguration.default
         configuration.httpMaximumConnectionsPerHost = 6
@@ -64,7 +67,7 @@ final class RemoteFile: @unchecked Sendable {
               let total = range.split(separator: "/").last.flatMap({ Int64($0) }) else {
             throw EnhancedPlayerError.rangeRequestsUnsupported(url)
         }
-        let file = RemoteFile(url: url, length: total, blockSize: blockSize, session: session, headers: headers, directory: directory, diskBudget: diskBudget)
+        let file = RemoteFile(url: url, length: total, blockSize: blockSize, session: session, headers: headers, directory: directory, diskBudget: diskBudget, logger: logger)
         file.seed(data)
         return file
     }
@@ -155,10 +158,13 @@ final class RemoteFile: @unchecked Sendable {
             store(data, for: index)
             return
         }
+        let reason = error.map { $0.localizedDescription } ?? (status != 206 ? "HTTP \(status)" : "\(data?.count ?? 0) of \(expected) bytes")
         if attempt < 3 {
+            logger.warning("Source block \(index) attempt \(attempt + 1) failed (\(reason)), retrying")
             startFetch(index, attempt: attempt + 1)
             return
         }
+        logger.error("Source block \(index) failed after \(attempt + 1) attempts: \(reason)")
         if let error {
             failures[index] = EnhancedPlayerError.network(error.localizedDescription)
         } else if status != 206 {

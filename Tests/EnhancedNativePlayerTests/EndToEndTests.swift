@@ -1,5 +1,6 @@
 @preconcurrency import AVFoundation
 import Foundation
+import ImageIO
 import Testing
 @testable import EnhancedNativePlayer
 
@@ -273,6 +274,59 @@ struct EndToEndTests {
         await session.stop()
     }
 
+    /// Files with PGS subtitles: frames read straight after a seek are what a full pass
+    /// shows at that time, and choosing the rendition in AVPlayer says which track to draw.
+    @MainActor
+    @Test func pgsFramesAreRandomAccessAndSelectionIsSeen() async throws {
+        let session = try await EnhancedPlaybackSession.start(url: source)
+        guard let track = session.subtitleTrackNames.firstIndex(where: { session.pgsTrack(named: $0) != nil }) else {
+            await session.stop()
+            return
+        }
+        let last = session.subtitleSegment(atTicks: Int64(session.duration * 10_000_000))
+        var full: [PGSFrame] = []
+        for segment in 0...last {
+            let frames = try await session.pgsFrames(track: track, segment: segment)
+            full += frames.filter { frame in full.last.map { frame.startTicks > $0.startTicks } ?? true }
+        }
+        let drawn = full.filter { !$0.bitmaps.isEmpty }
+        print("PGS track \(track): \(full.count) frames, \(drawn.count) with bitmaps")
+        #expect(!drawn.isEmpty)
+        if let out, let frame = drawn.first, let image = frame.bitmaps.first?.makeImage() {
+            let url = out.appendingPathComponent("pgs_first.png") as CFURL
+            let destination = try #require(CGImageDestinationCreateWithURL(url, "public.png" as CFString, 1, nil))
+            CGImageDestinationAddImage(destination, image, nil)
+            #expect(CGImageDestinationFinalize(destination))
+        }
+
+        // A fresh session has read nothing, so each lookup stands alone.
+        let fresh = try await EnhancedPlaybackSession.start(url: source)
+        for wanted in stride(from: drawn.count / 2, to: drawn.count, by: max(1, drawn.count / 8)) {
+            let frame = drawn[wanted]
+            let ticks = frame.startTicks + 1
+            let frames = try await fresh.pgsFrames(track: track, segment: fresh.subtitleSegment(atTicks: ticks))
+            #expect(frames.last { $0.startTicks <= ticks } == frame, "frame at \(frame.startTicks)")
+        }
+        await fresh.stop()
+
+        let item = AVPlayerItem(url: session.masterPlaylistURL)
+        let player = AVPlayer(playerItem: item)
+        player.isMuted = true
+        try await waitUntil(timeout: 20) { item.status != .unknown }
+        let group = try #require(try await item.asset.loadMediaSelectionGroup(for: .legible))
+        var notified = false
+        let observer = NotificationCenter.default.addObserver(forName: AVPlayerItem.mediaSelectionDidChangeNotification, object: item, queue: .main) { _ in
+            MainActor.assumeIsolated { notified = true }
+        }
+        item.select(group.options[track], in: group)
+        try await waitUntil(timeout: 5) { notified }
+        NotificationCenter.default.removeObserver(observer)
+        let selected = item.currentMediaSelection.selectedMediaOption(in: group)
+        #expect(selected?.renditionName.flatMap { session.pgsTrack(named: $0) } == track)
+        player.pause()
+        await session.stop()
+    }
+
     /// HDR sources only: `master_sdr.m3u8` announces SDR, its segments restart byte for
     /// byte, and AVPlayer plays it with no HDR transfer function on the track.
     @MainActor
@@ -398,6 +452,19 @@ final class CueCollector: NSObject, AVPlayerItemLegibleOutputPushDelegate, @unch
 
 @Suite(.enabled(if: ProcessInfo.processInfo.environment["ENP_E2E_URL"] != nil))
 struct CleanupTests {
+    @Test func rebindKeepsThePlaylistURL() async throws {
+        let session = try await EnhancedPlaybackSession.start(url: URL(string: ProcessInfo.processInfo.environment["ENP_E2E_URL"]!)!)
+        let before = try await URLSession.shared.data(from: session.masterPlaylistURL).0
+        await session.rebindServer()
+        await session.rebindServer()
+        let after = try await URLSession.shared.data(from: session.masterPlaylistURL).0
+        #expect(after == before)
+        let segment = try await URLSession.shared.data(from: session.masterPlaylistURL.deletingLastPathComponent().appendingPathComponent("video_0.mp4"))
+        #expect((segment.1 as? HTTPURLResponse)?.statusCode == 200)
+        await session.stop()
+        await #expect(throws: (any Error).self) { _ = try await URLSession.shared.data(from: session.masterPlaylistURL) }
+    }
+
     @Test func stopDeletesEverything() async throws {
         let cache = FileManager.default.temporaryDirectory.appendingPathComponent("enp-cleanup-\(UUID().uuidString)")
         var configuration = EnhancedPlayerConfiguration()

@@ -42,8 +42,7 @@ public final class EnhancedPlaybackSession: Sendable {
     }
 
     public static func start(url: URL, configuration: EnhancedPlayerConfiguration = .init()) async throws -> EnhancedPlaybackSession {
-        var logger = Logger(label: "EnhancedNativePlayer")
-        logger.logLevel = .info
+        let logger = Logger.player
         let started = Date()
 
         let base = configuration.cacheDirectory
@@ -58,7 +57,8 @@ public final class EnhancedPlaybackSession: Sendable {
                 url: url,
                 headers: configuration.httpHeaders,
                 directory: directory.appendingPathComponent("source", isDirectory: true),
-                diskBudget: configuration.sourceCacheBytes
+                diskBudget: configuration.sourceCacheBytes,
+                logger: logger
             )
         } catch {
             try? FileManager.default.removeItem(at: directory)
@@ -100,6 +100,29 @@ public final class EnhancedPlaybackSession: Sendable {
         }
     }
 
+    /// The PGS track behind a subtitle rendition's name, nil for any other kind of track.
+    func pgsTrack(named name: String) -> Int? {
+        guard let track = subtitleTrackNames.firstIndex(of: name), core.context.media.subtitles[track].isPGS else { return nil }
+        return track
+    }
+
+    var hasPGSTracks: Bool { core.context.media.subtitles.contains(where: \.isPGS) }
+
+    /// The subtitle segment holding a position in the playlist timeline.
+    func subtitleSegment(atTicks ticks: Int64) -> Int {
+        min(max(0, Int(ticks / SubtitleGrid.segmentTicks)), core.context.subtitleGrid.count - 1)
+    }
+
+    func pgsFrames(track: Int, segment: Int) async throws -> [PGSFrame] {
+        guard segment < core.context.subtitleGrid.count else { return [] }
+        return try await core.pgsFrames.frames(track: core.context.media.subtitles[track], segment: segment)
+    }
+
+    /// What returning to the foreground does: a fresh listener on the same port.
+    func rebindServer() async {
+        await server.rebind()
+    }
+
     /// Stops the server and the remux, and deletes every segment and cached block.
     public func stop() async {
         await server.stop()
@@ -117,7 +140,8 @@ final class PlaybackSessionCore: Sendable {
     private let sdrVideo: SegmentPipeline
     private let audio: SegmentPipeline
     private let inits = InitSegmentStore()
-    private let subtitleCues: SubtitleCueStore
+    private let subtitleCues = SubtitleSegmentCache<[SubtitleCue]>()
+    let pgsFrames: PGSFrameStore
     private let logger: Logger
 
     init(context: RemuxContext, directory: URL, segmentsAhead: Int, logger: Logger) {
@@ -125,7 +149,7 @@ final class PlaybackSessionCore: Sendable {
         self.directory = directory
         self.logger = logger
         self.playlists = PlaylistBuilder(media: context.media, plan: context.plan, subtitleGrid: context.subtitleGrid)
-        subtitleCues = SubtitleCueStore(context: context)
+        pgsFrames = PGSFrameStore(context: context)
         video = SegmentPipeline(
             name: "video",
             directory: directory.appendingPathComponent("video", isDirectory: true),
@@ -212,7 +236,10 @@ final class PlaybackSessionCore: Sendable {
                 guard context.media.subtitles.indices.contains(track), (0..<context.subtitleGrid.count).contains(index) else { return Response(status: .notFound) }
                 let subtitle = context.media.subtitles[track]
                 guard let format = subtitle.textFormat else { return .webVTT(WebVTT.document([])) }
-                return .webVTT(WebVTT.document(try await subtitleCues.cues(track: subtitle, format: format, segment: index)))
+                let cues = try await subtitleCues.value(track: track, segment: index) {
+                    try SubtitleCueReader.read(context: context, track: subtitle, format: format, segment: index)
+                }
+                return .webVTT(WebVTT.document(cues))
             }
         } catch EnhancedPlayerError.segmentOutOfRange {
             return Response(status: .notFound)

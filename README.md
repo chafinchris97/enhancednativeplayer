@@ -35,8 +35,9 @@ Requirements: tvOS 17 / iOS 17 / macOS 14 (Hummingbird 2), and a source server t
 6. **Window.** Video and audio each have their own pipeline. A run pauses once it is 3 segments ahead of the newest request and resumes as requests advance. A served segment is deleted from disk. A request beyond the window (a seek), for a segment already sent, or for another audio track stops the run, deletes its segments and starts a new run at that segment.
 7. **Display mode (tvOS).** `EnhancedPlayerViewController` turns off `appliesPreferredDisplayCriteriaAutomatically` and sets the `preferredDisplayCriteria` of the master playlist's asset itself. It then waits for `isDisplayModeSwitchInProgress` to go true and false again, plus 0.5 s, or for 10 s if no switch starts. The wait is skipped when "Match Content" is off in Settings. Only then does the player get a URL.
 8. **Subtitles.** Every subtitle track is a rendition with its own playlist of 10 s WebVTT segments, `subtitle_{t}_{n}.vtt`, on a fixed grid independent of the video cuts. A segment's time follows from its index, so these URIs need no `runtimeTicks`. A request seeks on the keyframe index and reads only that stretch of the file, so a seek gets its cues right away. A cue goes in the segment its start lands in and keeps its full duration, even past the segment's end. SRT, plain text, `mov_text` and Matroska WebVTT are read directly from packets, without a decoder. ASS and bitmap tracks (PGS, VobSub, DVB) are listed, but their segments are empty.
-9. **SDR displays.** tvOS cannot report the display's mode, so an HDR file is always offered its HDR master first. If AVPlayer refuses it for the display (`-11868`, `-11848` or `-1002`, within about 60 ms and before any segment is fetched), the player gets `master_sdr.m3u8` instead. Its video is the same stream without a transcode: `SDRBitstreamRewriter` sets the SPS colour description and the `colr` box to Rec. 709 and removes SEI, Dolby Vision RPU / enhancement layer NAL units and the mastering metadata. Audio renditions are shared.
-10. **Stop.** `stop()` / dismissing the controller resets the display criteria, shuts the server down and deletes every segment and cached block.
+9. **PGS.** HLS can't carry bitmaps, so `EnhancedPlayerViewController` watches the subtitle selection and, when the chosen rendition is a PGS track, draws it itself in `contentOverlayView`, above the video and below the controls. Display sets are read on the same 10 s grid and parsed without a decoder. mkvmerge zlib-compresses PGS by default and this FFmpeg build has no zlib, so such blocks are inflated with Apple's Compression framework; the demuxer's "Unsupported encoding type" message for those tracks is expected. Since a display set can reuse objects and palettes from earlier in its epoch, and a subtitle can start before the segment does, a read also looks back up to 3 segments; only the segments around the playhead stay in memory. The PGS canvas maps to the screen, not to the video, so a subtitle authored on a 16:9 canvas keeps its place over a letterboxed picture. A canvas of another shape is fitted and centered.
+10. **SDR displays.** tvOS cannot report the display's mode, so an HDR file is always offered its HDR master first. If AVPlayer refuses it for the display (`-11868`, `-11848` or `-1002`, within about 60 ms and before any segment is fetched), the player gets `master_sdr.m3u8` instead. Its video is the same stream without a transcode: `SDRBitstreamRewriter` sets the SPS colour description and the `colr` box to Rec. 709 and removes SEI, Dolby Vision RPU / enhancement layer NAL units and the mastering metadata. Audio renditions are shared.
+11. **Stop.** `stop()` / dismissing the controller resets the display criteria, shuts the server down and deletes every segment and cached block.
 
 ### Why restarts produce identical segments
 
@@ -58,14 +59,20 @@ A run that starts at segment k must emit exactly what a run from the beginning w
 - **Lossy sources in FLAC.** For DTS core, Opus, MP3 and other lossy sources transcoded to FLAC, a restarted run has identical timing. The PCM can differ in the lowest bits, because lossy decoder state never re-converges bit-exactly after a seek. Lossless sources (DTS-HD MA, TrueHD, PCM) are bit-identical.
 - **Codecs.** Video must be H.264 or HEVC. TrueHD Atmos and DTS:X objects are lost in the FLAC path; only the bed is kept.
 - **Keyframe index required.** A file without a keyframe index (Matroska without Cues) is rejected rather than downloaded in full.
+- **Choosing a subtitle on tvOS.** Tracks are under Subtitles → Language. The menu can read "On" with no track selected, and pressing "On" then changes nothing, so no PGS track starts until one is picked under Language or the menu goes Off and back On.
+- **PGS needs `EnhancedPlayerViewController`.** An app with its own player gets the empty rendition and no bitmaps. A PGS track is drawn in SDR even over HDR video, and a subtitle that started more than 30 s before a seek target isn't recovered.
 - **Subtitle labels and selection.** `NAME` is just the language: `English`, then `English (2)`, `English (3)` for later tracks of the same language. Forced tracks are `English (Forced)` and are counted separately, since the menu hides forced renditions. The first non-forced track of each language, and every forced track, carries the real tag in `LANGUAGE` (`en`), so the menu shows the language name and the system language preference can match it. Later tracks of the same language, and tracks with no known language, carry their `NAME` in `LANGUAGE` so the menu keeps them apart. `DEFAULT=YES` goes to the first track with the container's default flag, unless every track has the flag (Matroska sets it unless a muxer clears it). `FORCED` follows the container's forced flag. `AUTOSELECT` is omitted.
 - **Subtitle reads in Matroska** cover the segment's stretch of the file, about 12 s plus a GOP, because the cues are interleaved with the video. Those blocks are the ones the video remux needs too, and each segment's cues are kept for the session, so a track is read once per segment. MP4 jumps straight to the cue samples.
 - **`master_sdr.m3u8` is a relabel, not a tone map.** The pixels are still PQ / HLG, so the picture looks washed out, and Dolby Vision profile 5 has wrong colours, since its base layer only makes sense with the RPU.
 - **The 10 s wait** also applies when the display already matches the stream, because no switch ever starts.
 
+## Logs
+
+The library logs to the unified system log under the subsystem `EnhancedNativePlayer`, so Console.app shows it on a device without Xcode attached. Choose the Apple TV, filter on `subsystem:EnhancedNativePlayer`, and turn on Action → Include Info Messages. Each playlist and segment request is logged when it arrives and when it is answered, along with source download retries, `AVPlayer`'s item status, waiting reason and error log.
+
 ## Tests
 
-Unit tests cover the cut rule, exact arithmetic, FLAC frame renumbering and routing. The end-to-end suite is opt-in, and runs on macOS and on the tvOS Simulator:
+Unit tests cover the cut rule, exact arithmetic, FLAC frame renumbering, routing and PGS decoding. The end-to-end suite is opt-in, and runs on macOS and on the tvOS Simulator:
 
 ```sh
 ENP_E2E_URL=http://127.0.0.1:8080/movie.mkv \
@@ -81,4 +88,5 @@ The end-to-end suite checks:
 - the 3-segment window and delete-after-send
 - cleanup on stop
 - real AVPlayer playback, seeking and audio-track switching
+- PGS frames read right after a seek matching a full pass of the track, and AVPlayer reporting the selected PGS rendition
 - subtitle segments on the 10 s grid, a segment reading only its stretch of the file, and AVPlayer showing a cue on time after a seek

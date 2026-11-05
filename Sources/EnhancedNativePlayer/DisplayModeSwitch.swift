@@ -1,28 +1,88 @@
 import AVFoundation
 import Foundation
 
+/// Waits out a display mode switch by its start and end notifications.
+///
+/// `AVDisplayManager.isDisplayModeSwitchInProgress` cannot be trusted for this. AVKit
+/// derives it from a count shared by the whole process: each delivery of PineBoard's
+/// `com.apple.pineboard.display_mode_switch_active` Darwin notification reads the
+/// current state and counts one up when it is set, one down when it is clear. Darwin
+/// notifications posted while an app is suspended are delivered together on resume, and
+/// every one of them reads the state as it is by then, so the count ends up off by however
+/// many switches PineBoard made in the meantime. Once it is above zero the property stays
+/// true until the process exits. The start and end notifications AVKit posts are sent
+/// on every delivery, whatever the count, so they still describe the switch the app asked for.
 enum DisplayModeSwitch {
-    /// Waits for a display mode switch requested just before the call: until it ends plus
-    /// `settle`, or for `startTimeout` if it never starts. Throws when cancelled.
+    enum Event: Equatable {
+        case started
+        case ended
+    }
+
+    enum Outcome: Equatable {
+        case switched
+        case neverStarted
+        /// The switch had started but not ended by `switchTimeout`.
+        case neverEnded
+    }
+
+    /// Waits for a display mode switch requested just before the call. `events` returns
+    /// the start and end notifications seen since the request, in order. Returns once a
+    /// switch has ended and `settle` has passed without another starting, after
+    /// `startTimeout` if nothing happens, or after `switchTimeout` if a switch never ends.
+    /// Throws when cancelled.
     @MainActor
+    @discardableResult
     static func wait(
-        isSwitching: () -> Bool,
+        events: () -> [Event],
         startTimeout: Duration = .seconds(10),
+        switchTimeout: Duration = .seconds(15),
         settle: Duration = .milliseconds(500),
         poll: Duration = .milliseconds(50)
-    ) async throws {
+    ) async throws -> Outcome {
         let clock = ContinuousClock()
-        let deadline = clock.now + startTimeout
-        while !isSwitching() {
-            if clock.now >= deadline { return }
+        let startDeadline = clock.now + startTimeout
+        while events().isEmpty {
+            if clock.now >= startDeadline { return .neverStarted }
             try await clock.sleep(for: poll)
         }
-        while isSwitching() {
-            try await clock.sleep(for: poll)
+        let switchDeadline = clock.now + switchTimeout
+        while true {
+            while events().last == .started {
+                if clock.now >= switchDeadline { return .neverEnded }
+                try await clock.sleep(for: poll)
+            }
+            // A frame rate change and a dynamic range change can come as two switches.
+            let seen = events().count
+            try await clock.sleep(for: settle)
+            if events().count == seen { return .switched }
         }
-        try await clock.sleep(for: settle)
     }
 }
+
+#if os(tvOS)
+import AVKit
+
+/// Records the display mode switch notifications from the moment it is created.
+@MainActor
+final class DisplayModeSwitchRecorder {
+    private(set) var events: [DisplayModeSwitch.Event] = []
+    private var observers: [any NSObjectProtocol] = []
+
+    init() {
+        let center = NotificationCenter.default
+        for (name, event) in [(Notification.Name.AVDisplayManagerModeSwitchStart, DisplayModeSwitch.Event.started), (.AVDisplayManagerModeSwitchEnd, .ended)] {
+            observers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.events.append(event) }
+            })
+        }
+    }
+
+    func invalidate() {
+        observers.forEach(NotificationCenter.default.removeObserver)
+        observers = []
+    }
+}
+#endif
 
 enum DisplayRefusal {
     /// Whether an item failed because AVPlayer will not present this master on the current

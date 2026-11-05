@@ -118,8 +118,11 @@ struct SubtitleTrack: Sendable {
     var title: String?
     var isDefault: Bool
     var isForced: Bool
-    /// Nil for ASS and bitmap subtitles, whose segments stay empty for now.
+    /// Nil for ASS and bitmap subtitles, whose segments stay empty.
     var textFormat: SubtitleTextFormat?
+
+    /// Drawn by `PGSSubtitleRenderer` instead of going through the playlist.
+    var isPGS: Bool { codecName == "hdmv_pgs_subtitle" }
 }
 
 /// Every video keyframe of the file, read from the container index.

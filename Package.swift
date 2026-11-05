@@ -17,7 +17,7 @@ let package = Package(
     dependencies: [
         .package(url: "https://github.com/superuser404notfound/FFmpegBuild", from: "3.11.0"),
         .package(url: "https://github.com/hummingbird-project/hummingbird", from: "2.28.0"),
-        .package(url: "https://github.com/apple/swift-log", from: "1.6.0"),
+        .package(url: "https://github.com/apple/swift-log", from: "1.11.0"),
         .package(url: "https://github.com/apple/swift-nio", from: "2.80.0"),
         .package(url: "https://github.com/apple/swift-nio-transport-services", from: "1.28.0"),
         .package(url: "https://github.com/swift-server/swift-service-lifecycle", from: "2.6.0"),
