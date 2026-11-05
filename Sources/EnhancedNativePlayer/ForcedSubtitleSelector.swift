@@ -5,15 +5,21 @@ import Logging
 /// no FORCED attribute, since AVPlayer matches forced tracks on the audio's LANGUAGE and that
 /// holds a label here, so the selection is made by hand: when the audio changes, and at the
 /// start, while subtitles are off or on a forced track. A track the user picked is left alone.
+///
+/// While AVPlayer applies its selection criteria, the system subtitle setting decides what is
+/// drawn: with subtitles off it draws only FORCED renditions, so a selected forced track stays
+/// blank. Selecting one therefore turns the automatic criteria off for the player.
 @MainActor
 final class ForcedSubtitleSelector {
     private let session: EnhancedPlaybackSession
+    private weak var player: AVPlayer?
     private var observer: NSObjectProtocol?
     private var audioName: String?
     private var task: Task<Void, Never>?
 
-    init(session: EnhancedPlaybackSession, item: AVPlayerItem) {
+    init(session: EnhancedPlaybackSession, player: AVPlayer, item: AVPlayerItem) {
         self.session = session
+        self.player = player
         observer = NotificationCenter.default.addObserver(forName: AVPlayerItem.mediaSelectionDidChangeNotification, object: item, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.update(item) }
         }
@@ -43,6 +49,7 @@ final class ForcedSubtitleSelector {
             guard wanted != current?.renditionName else { return }
             let option = wanted.flatMap { name in legible.options.first { $0.renditionName == name } }
             Logger.player.info("Forced subtitles for \(audio): \(option?.renditionName ?? "none")")
+            if option != nil { self.player?.appliesMediaSelectionCriteriaAutomatically = false }
             item.select(option, in: legible)
         }
     }

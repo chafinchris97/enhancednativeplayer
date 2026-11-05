@@ -185,7 +185,7 @@ public final class EnhancedPlayerViewController: UIViewController {
         self.player = player
         playerViewController.player = player
         forcedSubtitles?.stop()
-        forcedSubtitles = session.hasForcedSubtitles ? ForcedSubtitleSelector(session: session, item: item) : nil
+        forcedSubtitles = session.hasForcedSubtitles ? ForcedSubtitleSelector(session: session, player: player, item: item) : nil
         if session.hasPGSTracks, let overlay = playerViewController.contentOverlayView {
             let renderer = pgsRenderer ?? PGSSubtitleRenderer(session: session, container: overlay)
             pgsRenderer = renderer
