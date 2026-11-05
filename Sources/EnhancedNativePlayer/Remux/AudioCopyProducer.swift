@@ -62,7 +62,7 @@ struct AudioCopyProducer: SegmentProducer {
         let demuxer = try openAudioDemuxer(context: context, track: track, start: start, token: run.token)
         let input = demuxer.stream(track.streamIndex)
         let writer = try FragmentedMP4Writer { try Self.configure($0, from: input) }
-        let emitter = SegmentEmitter(writer: writer, run: run)
+        let emitter = SegmentEmitter(writer: writer, run: run, segmentCount: context.plan.count)
         let inTB = track.timeBase
         let outTB = emitter.timeBase
         let offset = context.timeline.offset(in: inTB)

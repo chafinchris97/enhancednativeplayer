@@ -82,7 +82,7 @@ struct FLACTranscodeProducer: SegmentProducer {
         var encoder: UnsafeMutablePointer<AVCodecContext>? = try format.makeEncoder()
         defer { avcodec_free_context(&encoder) }
         let writer = try FragmentedMP4Writer { output in try FLACFormat.configure(output, from: encoder!) }
-        let emitter = SegmentEmitter(writer: writer, run: run)
+        let emitter = SegmentEmitter(writer: writer, run: run, segmentCount: context.plan.count)
         let blockSize = Int64(encoder!.pointee.frame_size > 0 ? encoder!.pointee.frame_size : 4608)
 
         let sampleTB = Rational(num: 1, den: format.sampleRate)

@@ -6,17 +6,24 @@ import Foundation
 /// Packets are held back by one so each one's duration is the distance to the next
 /// packet's dts. The last sample of a segment therefore ends exactly where the first
 /// sample of the next segment starts, instead of relying on container durations.
+///
+/// Every segment from the run's start to the end of the plan is published, empty where
+/// the input has no samples for it: a track that starts late (an audio track whose
+/// first frame is 30 s in) or ends early would otherwise leave requests that no
+/// packet ever answers, and the player retries them until it gives up.
 final class SegmentEmitter {
     private let writer: FragmentedMP4Writer
     private let run: RemuxRun
+    private let segmentCount: Int
     private var pending: (packet: Packet, segment: Int)?
     private var lastDTS = Int64.min
     private var wroteInit = false
     private var lastPublished: Int?
 
-    init(writer: FragmentedMP4Writer, run: RemuxRun) {
+    init(writer: FragmentedMP4Writer, run: RemuxRun, segmentCount: Int) {
         self.writer = writer
         self.run = run
+        self.segmentCount = segmentCount
     }
 
     var timeBase: Rational { writer.timeBase }
@@ -34,17 +41,23 @@ final class SegmentEmitter {
                 try finish(previousSegment, next: segment)
                 try run.waitForWindow(before: segment)
             }
+        } else {
+            try publishEmpty(run.startSegment..<segment)
         }
         pending = (packet, segment)
     }
 
     /// End of input: the last packet keeps its own duration, or `fallbackDuration`.
     func finish(fallbackDuration: Int64) throws {
-        guard let (previous, segment) = pending else { return }
+        guard let (previous, segment) = pending else {
+            if lastPublished == nil { try publishEmpty(run.startSegment..<segmentCount) }
+            return
+        }
         pending = nil
         if previous.duration <= 0 { previous.duration = max(1, fallbackDuration) }
         try write(previous)
         try finish(segment, next: nil)
+        try publishEmpty((segment + 1)..<segmentCount)
     }
 
     private func write(_ packet: Packet) throws {
@@ -66,11 +79,14 @@ final class SegmentEmitter {
         lastPublished = segment
         // A gap in the input longer than a segment leaves segments without samples.
         // Publish them empty so requests for them do not hang.
-        if let next, next > segment + 1 {
-            for empty in (segment + 1)..<next {
-                try run.waitForWindow(before: empty)
-                try run.publish(segment: empty, data: FragmentedMP4Writer.styp)
-            }
+        if let next { try publishEmpty((segment + 1)..<next) }
+    }
+
+    private func publishEmpty(_ segments: Range<Int>) throws {
+        for empty in segments {
+            try run.waitForWindow(before: empty)
+            try run.publish(segment: empty, data: FragmentedMP4Writer.styp)
+            lastPublished = empty
         }
     }
 

@@ -30,7 +30,7 @@ struct VideoProducer: SegmentProducer {
         }
 
         let writer = try FragmentedMP4Writer { try Self.configure($0, from: input, video: video, rewriter: rewriter) }
-        let emitter = SegmentEmitter(writer: writer, run: run)
+        let emitter = SegmentEmitter(writer: writer, run: run, segmentCount: context.plan.count)
         let inTB = video.timeBase
         let outTB = emitter.timeBase
         let offset = context.timeline.offset(in: inTB)
