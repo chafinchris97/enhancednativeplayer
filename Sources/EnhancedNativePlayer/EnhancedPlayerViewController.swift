@@ -14,14 +14,14 @@ import UIKit
 ///
 /// AVPlayerViewController must not be subclassed, so it is embedded as a child.
 /// On tvOS the display mode is matched to the stream before playback starts. An HDR
-/// file whose master AVPlayer refuses for the display plays from `sdrMasterPlaylistURL`. Dismissing
+/// file whose master AVPlayer refuses for the display falls back to the SDR relabel. Dismissing
 /// this controller ends playback, resets the display mode, stops the local server and
 /// deletes every cached segment.
 @MainActor
 public final class EnhancedPlayerViewController: UIViewController {
     public let playerViewController = AVPlayerViewController()
     public private(set) var player: AVPlayer?
-    public private(set) var session: EnhancedPlaybackSession?
+    private var session: EnhancedPlaybackSession?
     /// Called on the main actor if the file cannot be opened or playback fails.
     public var onError: ((Error) -> Void)?
 

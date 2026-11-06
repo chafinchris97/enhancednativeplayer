@@ -5,27 +5,24 @@ import Logging
 /// One playback of one remote file: probe, plan, local HLS server and the remux
 /// pipelines behind it.
 ///
-/// ```swift
-/// let session = try await EnhancedPlaybackSession.start(url: remoteFileURL)
-/// let player = AVPlayer(url: session.masterPlaylistURL)
-/// ...
-/// await session.stop()   // stops the server and deletes every cached file
-/// ```
-public final class EnhancedPlaybackSession: Sendable {
+/// Internal: the only way to play is `EnhancedPlayerViewController`, since PGS and ASS
+/// drawing, forced-subtitle selection, display-mode matching and the SDR fallback all
+/// live there. `stop()` stops the server and deletes every cached file.
+final class EnhancedPlaybackSession: Sendable {
     /// `http://127.0.0.1:{port}/master.m3u8`
-    public let masterPlaylistURL: URL
+    let masterPlaylistURL: URL
     /// `http://127.0.0.1:{port}/master_sdr.m3u8`: the same stream with the video relabeled
     /// as Rec. 709 and its HDR metadata removed, for playing HDR on an SDR display. Nil
     /// when the file is not HDR, or its codec configuration cannot be rewritten.
-    public let sdrMasterPlaylistURL: URL?
+    let sdrMasterPlaylistURL: URL?
     /// Whether the file's video is HDR10, HLG or Dolby Vision.
-    public let isHDR: Bool
+    let isHDR: Bool
     /// Duration of the playlist timeline in seconds.
-    public let duration: TimeInterval
+    let duration: TimeInterval
     /// The `NAME` of each audio rendition, in `audio_{n}` order.
-    public let audioTrackNames: [String]
+    let audioTrackNames: [String]
     /// The `NAME` of each subtitle rendition, in `subtitle_{n}` order.
-    public let subtitleTrackNames: [String]
+    let subtitleTrackNames: [String]
 
     private let core: PlaybackSessionCore
     private let server: HLSServer
@@ -41,7 +38,7 @@ public final class EnhancedPlaybackSession: Sendable {
         self.subtitleTrackNames = core.playlists.subtitleNames()
     }
 
-    public static func start(url: URL, configuration: EnhancedPlayerConfiguration = .init()) async throws -> EnhancedPlaybackSession {
+    static func start(url: URL, configuration: EnhancedPlayerConfiguration = .init()) async throws -> EnhancedPlaybackSession {
         let logger = Logger.player
         let started = Date()
 
@@ -141,7 +138,7 @@ public final class EnhancedPlaybackSession: Sendable {
     }
 
     /// Stops the server and the remux, and deletes every segment and cached block.
-    public func stop() async {
+    func stop() async {
         await server.stop()
         core.shutdown()
     }

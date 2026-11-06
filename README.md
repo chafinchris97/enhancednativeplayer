@@ -12,14 +12,7 @@ player.modalPresentationStyle = .fullScreen
 present(player, animated: true)   // dismissing it resets the display mode, stops the server and deletes the cache
 ```
 
-Or drive `AVPlayer` yourself:
-
-```swift
-let session = try await EnhancedPlaybackSession.start(url: remoteURL)
-let player = AVPlayer(url: session.masterPlaylistURL)
-// …
-await session.stop()
-```
+`EnhancedPlayerViewController` is the only way in: the remuxer isn't usable on its own, because PGS and ASS drawing, forced-subtitle selection, display-mode matching and the SDR fallback all depend on it.
 
 `EnhancedPlayerConfiguration` sets the segment duration (`hls_time`, default 6), the look-ahead (default 3 segments), HTTP headers for the source, the cache directory and the source cache budget.
 
@@ -53,14 +46,14 @@ A run that starts at segment k must emit exactly what a run from the beginning w
 ## Notes and limits
 
 - **Audio labels.** AVFoundation derives an option's `displayName`, which the AVPlayerViewController audio menu shows, from `LANGUAGE` and ignores `NAME`. The `{Language} - {Title} - {Codec}` label is therefore written to both. As a result, AVPlayer does not auto-select by the user's preferred language; the container's default track is marked `DEFAULT=YES`.
-- **Enhance Dialogue** needs the audio session in `.playback` / `.moviePlayback`. `EnhancedPlayerViewController` sets that itself and deactivates the session when it stops; an app using `EnhancedPlaybackSession` with its own player has to do the same.
+- **Enhance Dialogue** needs the audio session in `.playback` / `.moviePlayback`. `EnhancedPlayerViewController` sets that itself and deactivates the session when it stops.
 - **Dolby Vision profile 8** gets a second variant with a plain `hvc1` `CODECS` string as an HDR10/HLG fallback.
 - **Parameter sets only in-band.** Some HEVC files have an empty `hvcC` and carry VPS / SPS / PPS at each keyframe. AVPlayer fails on such a sample entry with CoreMedia `-19601`, so the probe fills the record from the first video packet.
 - **Lossy sources in FLAC.** For DTS core, Opus, MP3 and other lossy sources transcoded to FLAC, a restarted run has identical timing. The PCM can differ in the lowest bits, because lossy decoder state never re-converges bit-exactly after a seek. Lossless sources (DTS-HD MA, TrueHD, PCM) are bit-identical.
 - **Codecs.** Video must be H.264 or HEVC. TrueHD Atmos and DTS:X objects are lost in the FLAC path; only the bed is kept.
 - **Keyframe index required.** A file without a keyframe index (Matroska without Cues) is rejected rather than downloaded in full.
 - **Choosing a subtitle on tvOS.** Tracks are under Subtitles → Language. The menu can read "On" with no track selected, and pressing "On" then changes nothing, so no PGS track starts until one is picked under Language or the menu goes Off and back On.
-- **PGS needs `EnhancedPlayerViewController`.** An app with its own player gets the empty rendition and no bitmaps. A PGS track is drawn in SDR even over HDR video, and a subtitle that started more than 30 s before a seek target isn't recovered.
+- **PGS limits.** A PGS track is drawn in SDR even over HDR video, and a subtitle that started more than 30 s before a seek target isn't recovered.
 - **Subtitle labels and selection.** `NAME` is just the language: `English`, then `English (2)`, `English (3)` for later tracks of the same language. Forced tracks are `English (Forced)`, counted separately. The first non-forced track of each language carries the real tag in `LANGUAGE` (`en`), so the menu shows the language name and the system language preference can match it. Forced tracks, later tracks of the same language, and tracks with no known language carry their `NAME` in `LANGUAGE` so the menu keeps them apart. No rendition is marked `FORCED`: AVPlayer turns a forced track on only when the audio's `LANGUAGE` matches, and the audio `LANGUAGE` holds a label. Instead `EnhancedPlayerViewController` selects the forced track of the audio's language at the start and whenever the audio changes, as long as subtitles are off or on a forced track; a track the user picked is left alone. With the system subtitle setting off, AVPlayer draws only `FORCED` renditions while it applies its automatic selection criteria, so selecting a forced track also sets `appliesMediaSelectionCriteriaAutomatically` to false for that player. `DEFAULT=YES` goes to the first non-forced track with the container's default flag, unless every non-forced track has the flag (Matroska sets it unless a muxer clears it). `AUTOSELECT` is omitted.
 - **Subtitle reads in Matroska** cover the segment's stretch of the file, about 12 s plus a GOP, because the cues are interleaved with the video. Those blocks are the ones the video remux needs too, and each segment's cues are kept for the session, so a track is read once per segment. MP4 jumps straight to the cue samples.
 - **`master_sdr.m3u8` is a relabel, not a tone map.** The pixels are still PQ / HLG, so the picture looks washed out, and Dolby Vision profile 5 has wrong colours, since its base layer only makes sense with the RPU.
