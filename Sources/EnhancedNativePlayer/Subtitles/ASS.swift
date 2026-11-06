@@ -229,7 +229,13 @@ final class LibassRenderer: @unchecked Sendable {
         return last
     }
 
-    /// Blends the images, back to front as libass lists them, into one bitmap the size of their union.
+    private static let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+    private static let grayColorSpace = CGColorSpaceCreateDeviceGray()
+
+    /// Blends the images, back to front as libass lists them, into one bitmap the size of
+    /// their union. Each libass bitmap is a coverage mask filled with its colour by Core
+    /// Graphics, whose optimised blending this leaves to, so a frame with hundreds of
+    /// images stays fast in a debug build too.
     private func compose(_ first: UnsafeMutablePointer<ASS_Image>?) -> ASSRenderedFrame {
         var bounds = CGRect.null
         var node = first
@@ -242,54 +248,38 @@ final class LibassRenderer: @unchecked Sendable {
         guard !bounds.isNull else { return ASSRenderedFrame(image: nil, rect: .zero) }
         let originX = Int(bounds.minX), originY = Int(bounds.minY)
         let width = Int(bounds.width), height = Int(bounds.height)
-        let bytesPerRow = width * 4
-        var pixels = [UInt8](repeating: 0, count: bytesPerRow * height)
-        pixels.withUnsafeMutableBufferPointer { out in
-            var node = first
-            while let image = node {
-                node = image.pointee.next
-                let w = Int(image.pointee.w), h = Int(image.pointee.h)
-                guard w > 0, h > 0, let bitmap = image.pointee.bitmap else { continue }
-                var color = image.pointee.color
-                if let colorMatrix { color = colorMatrix.apply(color) }
-                let opacity = 255 - Int(color & 0xFF)
-                guard opacity > 0 else { continue }
-                let red = Int(color >> 24), green = Int(color >> 16 & 0xFF), blue = Int(color >> 8 & 0xFF)
-                let stride = Int(image.pointee.stride)
-                let left = Int(image.pointee.dst_x) - originX, top = Int(image.pointee.dst_y) - originY
-                for row in 0..<h {
-                    let source = bitmap + row * stride
-                    var target = (top + row) * bytesPerRow + left * 4
-                    for column in 0..<w {
-                        let coverage = Int(source[column])
-                        if coverage != 0 {
-                            let alpha = (coverage * opacity + 127) / 255
-                            let keep = 255 - alpha
-                            out[target] = UInt8((blue * alpha + Int(out[target]) * keep + 127) / 255)
-                            out[target + 1] = UInt8((green * alpha + Int(out[target + 1]) * keep + 127) / 255)
-                            out[target + 2] = UInt8((red * alpha + Int(out[target + 2]) * keep + 127) / 255)
-                            out[target + 3] = UInt8((255 * alpha + Int(out[target + 3]) * keep + 127) / 255)
-                        }
-                        target += 4
-                    }
-                }
-            }
+        guard let context = CGContext(
+            data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0, space: Self.colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+        ) else { return ASSRenderedFrame(image: nil, rect: .zero) }
+        context.interpolationQuality = .none
+        context.setShouldAntialias(false)
+        node = first
+        while let image = node {
+            node = image.pointee.next
+            let w = Int(image.pointee.w), h = Int(image.pointee.h)
+            guard w > 0, h > 0, let bitmap = image.pointee.bitmap else { continue }
+            var color = image.pointee.color
+            if let colorMatrix { color = colorMatrix.apply(color) }
+            let opacity = 255 - Int(color & 0xFF)
+            guard opacity > 0 else { continue }
+            let stride = Int(image.pointee.stride)
+            // libass keeps the bitmap until the next render, and it is only drawn here, so no copy.
+            guard let provider = CGDataProvider(dataInfo: nil, data: bitmap, size: stride * h, releaseData: { _, _, _ in }),
+                  let mask = CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 8, bytesPerRow: stride, space: Self.grayColorSpace, bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue), provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
+            else { continue }
+            // Bitmap contexts put y = 0 at the bottom; libass puts it at the top.
+            let rect = CGRect(x: Int(image.pointee.dst_x) - originX, y: height - (Int(image.pointee.dst_y) - originY) - h, width: w, height: h)
+            context.saveGState()
+            context.clip(to: rect, mask: mask)
+            context.setFillColor(CGColor(
+                colorSpace: Self.colorSpace,
+                components: [CGFloat(color >> 24) / 255, CGFloat(color >> 16 & 0xFF) / 255, CGFloat(color >> 8 & 0xFF) / 255, CGFloat(opacity) / 255]
+            )!)
+            context.fill(rect)
+            context.restoreGState()
         }
-        let data = Data(pixels)
-        guard let provider = CGDataProvider(data: data as CFData) else { return ASSRenderedFrame(image: nil, rect: .zero) }
-        let image = CGImage(
-            width: width,
-            height: height,
-            bitsPerComponent: 8,
-            bitsPerPixel: 32,
-            bytesPerRow: bytesPerRow,
-            space: CGColorSpace(name: CGColorSpace.sRGB)!,
-            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue),
-            provider: provider,
-            decode: nil,
-            shouldInterpolate: false,
-            intent: .defaultIntent
-        )
+        guard let image = context.makeImage() else { return ASSRenderedFrame(image: nil, rect: .zero) }
         return ASSRenderedFrame(image: image, rect: CGRect(x: originX, y: originY, width: width, height: height))
     }
 }

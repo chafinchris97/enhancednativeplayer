@@ -1,130 +1,282 @@
 import AVFoundation
 import CoreGraphics
+import CoreMedia
+import CoreVideo
 import Foundation
-import QuartzCore
 
-/// Turns rendered frames into one discrete key-frame animation for a layer inside an
-/// `AVSynchronizedLayer`, where animation time is the player item's time.
-enum ASSKeyframes {
-    /// Each image switches this much before its frame starts, so floating point in the key
-    /// times can never make it late. Far shorter than any frame.
-    static let switchEarlySeconds = 0.000_1
+/// One subtitle sample: `images[index]` from `start` for `duration`, in playlist ticks.
+struct ASSSampleRun: Equatable {
+    var start: Int64
+    var duration: Int64
+    var index: Int
+}
 
-    /// 1×1 transparent, for frames with nothing on screen: `contents` can't animate to nil.
-    static let empty: CGImage = {
-        let context = CGContext(data: nil, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4, space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue)!
-        return context.makeImage()!
-    }()
-
-    /// Shows `images[i]` from `frames[i]` (playlist ticks) until the next frame, and the last
-    /// one until `end`. Runs of the same image become one key. Rects are divided by `scale`
-    /// into the layer's points; the layer's anchor point must be at its origin.
-    static func animation(frames: [Int64], images: [ASSRenderedFrame], end: Int64, scale: CGFloat) -> CAAnimationGroup? {
-        guard let first = frames.first, scale > 0 else { return nil }
-        let start = Double(first) / 10_000_000
-        let duration = Double(end - first) / 10_000_000
-        guard duration > 0 else { return nil }
-        var keyTimes: [NSNumber] = []
-        var contents: [Any] = []
-        var positions: [NSValue] = []
-        var sizes: [NSValue] = []
-        var previous: CGImage??
-        for (time, frame) in zip(frames, images) {
-            if let previous, previous === frame.image { continue }
-            previous = .some(frame.image)
-            let offset = keyTimes.isEmpty ? 0 : max(0, Double(time) / 10_000_000 - start - switchEarlySeconds)
-            keyTimes.append(NSNumber(value: offset / duration))
-            contents.append(frame.image ?? empty)
-            let rect = frame.image == nil ? CGRect.zero : CGRect(x: frame.rect.minX / scale, y: frame.rect.minY / scale, width: frame.rect.width / scale, height: frame.rect.height / scale)
-            positions.append(.of(rect.origin))
-            sizes.append(.of(CGRect(origin: .zero, size: rect.size)))
+enum ASSSamples {
+    /// `images[i]` shows from `frames[i]` until the next frame, the last one until `end`.
+    /// Consecutive frames with the same image become one run.
+    static func runs(frames: [Int64], images: [ASSRenderedFrame], end: Int64) -> [ASSSampleRun] {
+        var runs: [ASSSampleRun] = []
+        for (index, frame) in frames.enumerated() {
+            let next = index + 1 < frames.count ? frames[index + 1] : end
+            guard next > frame else { continue }
+            if let last = runs.last, images[last.index].image === images[index].image {
+                runs[runs.count - 1].duration = next - last.start
+            } else {
+                runs.append(ASSSampleRun(start: frame, duration: next - frame, index: index))
+            }
         }
-        // Discrete key frames take one more key time than values; the last value holds to the end.
-        keyTimes.append(1)
-        func animation(_ keyPath: String, _ values: [Any]) -> CAKeyframeAnimation {
-            let animation = CAKeyframeAnimation(keyPath: keyPath)
-            animation.calculationMode = .discrete
-            animation.values = values
-            animation.keyTimes = keyTimes
-            return animation
+        return runs
+    }
+
+    /// `frames` cut into at most `count` runs of consecutive frames, as even as they go.
+    static func chunks(of frames: [Int64], count: Int) -> [[Int64]] {
+        let count = max(1, min(count, frames.count))
+        guard count > 1 else { return [frames] }
+        var chunks: [[Int64]] = []
+        var start = 0
+        for index in 0..<count {
+            let end = (frames.count * (index + 1)) / count
+            chunks.append(Array(frames[start..<end]))
+            start = end
         }
-        let group = CAAnimationGroup()
-        group.animations = [animation("contents", contents), animation("position", positions), animation("bounds", sizes)]
-        // In a synchronized layer the begin time is item time, and 0 would mean "now".
-        group.beginTime = start == 0 ? AVCoreAnimationBeginTimeAtZero : start
-        group.duration = duration
-        group.fillMode = .both
-        group.isRemovedOnCompletion = false
-        return group
+        return chunks
+    }
+
+    /// One sample a worker made: `frame` from `start` for `duration`, in playlist ticks.
+    struct Piece: @unchecked Sendable {
+        var start: Int64
+        var duration: Int64
+        var frame: ASSRenderedFrame
+        var sample: CMSampleBuffer?
+        /// Set when `duration` grew after the sample was made, so its timing must be redone.
+        var retimed = false
+    }
+
+    /// The workers' pieces back in one list. Each worker composes its own bitmaps, so an
+    /// image that carries on from one chunk into the next is two pieces with the same
+    /// pixels; those become one longer piece, so a still subtitle stays one sample.
+    static func merged(_ chunks: [[Piece]]) -> [Piece] {
+        var pieces: [Piece] = []
+        for chunk in chunks {
+            for (index, piece) in chunk.enumerated() {
+                if index == 0, let last = pieces.last, last.start + last.duration == piece.start, sameContent(last.frame, piece.frame) {
+                    pieces[pieces.count - 1].duration += piece.duration
+                    pieces[pieces.count - 1].retimed = true
+                } else {
+                    pieces.append(piece)
+                }
+            }
+        }
+        return pieces
+    }
+
+    private static func sameContent(_ a: ASSRenderedFrame, _ b: ASSRenderedFrame) -> Bool {
+        guard let left = a.image, let right = b.image else { return a.image == nil && b.image == nil }
+        guard a.rect == b.rect, left.bytesPerRow == right.bytesPerRow, left.bitmapInfo == right.bitmapInfo,
+              let leftData = left.dataProvider?.data, let rightData = right.dataProvider?.data else { return false }
+        return (leftData as Data) == (rightData as Data)
+    }
+
+    /// Sample buffers handed from the render queue to the main thread. They are not touched
+    /// again once made, so passing them across is safe.
+    struct Batch: @unchecked Sendable {
+        var samples: [CMSampleBuffer]
     }
 }
 
-private extension NSValue {
-    static func of(_ point: CGPoint) -> NSValue {
-        #if canImport(UIKit)
-        NSValue(cgPoint: point)
-        #else
-        NSValue(point: point)
-        #endif
+/// Draws rendered frames into IOSurface-backed BGRA buffers the size of the overlay, in
+/// pixels, and wraps them as sample buffers timed on the playlist timeline. Not thread-safe.
+final class ASSSampleBufferFactory {
+    private static let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+    private var pool: CVPixelBufferPool?
+    private var size = (width: 0, height: 0)
+    /// The transparent buffer every run without text shares.
+    private var empty: CVPixelBuffer?
+
+    func sample(for frame: ASSRenderedFrame, width: Int, height: Int, start: Int64, duration: Int64) -> CMSampleBuffer? {
+        guard width > 0, height > 0 else { return nil }
+        if size != (width, height) {
+            size = (width, height)
+            pool = nil
+            empty = nil
+            let attributes: [CFString: Any] = [
+                kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey: width,
+                kCVPixelBufferHeightKey: height,
+                kCVPixelBufferIOSurfacePropertiesKey: [CFString: Any](),
+            ]
+            CVPixelBufferPoolCreate(nil, nil, attributes as CFDictionary, &pool)
+        }
+        let buffer: CVPixelBuffer?
+        if let image = frame.image {
+            buffer = draw(image, in: frame.rect)
+        } else {
+            if empty == nil { empty = draw(nil, in: .zero) }
+            buffer = empty
+        }
+        guard let buffer else { return nil }
+        var format: CMVideoFormatDescription?
+        guard CMVideoFormatDescriptionCreateForImageBuffer(allocator: nil, imageBuffer: buffer, formatDescriptionOut: &format) == noErr, let format else { return nil }
+        var timing = CMSampleTimingInfo(
+            duration: CMTime(value: duration, timescale: 10_000_000),
+            presentationTimeStamp: CMTime(value: start, timescale: 10_000_000),
+            decodeTimeStamp: .invalid
+        )
+        var sample: CMSampleBuffer?
+        guard CMSampleBufferCreateReadyWithImageBuffer(allocator: nil, imageBuffer: buffer, formatDescription: format, sampleTiming: &timing, sampleBufferOut: &sample) == noErr else { return nil }
+        return sample
     }
 
-    static func of(_ rect: CGRect) -> NSValue {
-        #if canImport(UIKit)
-        NSValue(cgRect: rect)
-        #else
-        NSValue(rect: rect)
-        #endif
+    /// A buffer from the pool, cleared, with `image` drawn at `rect` (top-left origin, pixels).
+    private func draw(_ image: CGImage?, in rect: CGRect) -> CVPixelBuffer? {
+        guard let pool else { return nil }
+        var created: CVPixelBuffer?
+        guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &created) == kCVReturnSuccess, let buffer = created else { return nil }
+        CVPixelBufferLockBaseAddress(buffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+        let width = CVPixelBufferGetWidth(buffer)
+        let height = CVPixelBufferGetHeight(buffer)
+        guard let context = CGContext(
+            data: CVPixelBufferGetBaseAddress(buffer), width: width, height: height, bitsPerComponent: 8,
+            bytesPerRow: CVPixelBufferGetBytesPerRow(buffer), space: Self.colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+        ) else { return nil }
+        context.clear(CGRect(x: 0, y: 0, width: width, height: height))
+        if let image {
+            // Bitmap contexts put y = 0 at the bottom row.
+            context.draw(image, in: CGRect(x: rect.minX, y: CGFloat(height) - rect.maxY, width: rect.width, height: rect.height))
+        }
+        CVBufferSetAttachment(buffer, kCVImageBufferCGColorSpaceKey, Self.colorSpace, .shouldPropagate)
+        return buffer
     }
 }
 
-/// Runs a `LibassRenderer` on its own serial queue. libass is not thread-safe, and rendering
-/// a stretch of frames ahead of the playhead must not hold up the main thread.
+/// Renders with several `LibassRenderer`s at once, each on its own serial queue. libass is
+/// not thread-safe, so every worker has its own library, renderer and track with the same
+/// fonts, events and layout; they share nothing. A stretch of frames is split into one run
+/// of consecutive frames per worker, so heavy typesetting renders on several cores, and
+/// none of it holds up the main thread.
 final class ASSRenderEngine: @unchecked Sendable {
-    private let queue = DispatchQueue(label: "ENP.ass", qos: .userInitiated)
-    /// Only touched on `queue`.
-    private let renderer: LibassRenderer
-    /// Only touched on `queue`: the frames of the last batch, reused by the next one while
-    /// the generation holds.
-    private var cache: (generation: Int, frames: [Int64: ASSRenderedFrame]) = (0, [:])
+    /// One libass instance keeps up with the typesetting tested so far. If heavier scripts
+    /// fall behind (the renderer logs it), more workers split each stretch across cores:
+    /// `min(4, max(1, ProcessInfo.processInfo.activeProcessorCount - 2))` leaves two for
+    /// decoding and the app.
+    static var defaultWorkerCount: Int { 1 }
+
+    private final class Worker: @unchecked Sendable {
+        let queue: DispatchQueue
+        /// Only touched on `queue`.
+        let renderer: LibassRenderer
+        /// Only touched on `queue`: the frames of the last chunk, reused by the next one while
+        /// the generation holds.
+        var cache: (generation: Int, frames: [Int64: ASSRenderedFrame]) = (0, [:])
+        /// Only touched on `queue`.
+        let factory = ASSSampleBufferFactory()
+
+        init(index: Int, renderer: LibassRenderer) {
+            queue = DispatchQueue(label: "ENP.ass.\(index)", qos: .userInitiated)
+            self.renderer = renderer
+        }
+
+        func render(_ frames: [Int64], generation: Int) -> [ASSRenderedFrame] {
+            let cached = cache.generation == generation ? cache.frames : [:]
+            var images: [ASSRenderedFrame] = []
+            var kept: [Int64: ASSRenderedFrame] = [:]
+            for frame in frames {
+                let time = ASSTime.milliseconds(ticks: frame)
+                let image = cached[time] ?? renderer.render(atMilliseconds: time)
+                images.append(image)
+                kept[time] = image
+            }
+            cache = (generation, kept)
+            return images
+        }
+
+        /// Renders `frames` and makes their samples, the last frame's until `end`.
+        func pieces(_ frames: [Int64], end: Int64, width: Int, height: Int, generation: Int) -> [ASSSamples.Piece] {
+            let images = render(frames, generation: generation)
+            return ASSSamples.runs(frames: frames, images: images, end: end).map { run in
+                ASSSamples.Piece(
+                    start: run.start, duration: run.duration, frame: images[run.index],
+                    sample: factory.sample(for: images[run.index], width: width, height: height, start: run.start, duration: run.duration)
+                )
+            }
+        }
+    }
+
+    private let workers: [Worker]
+    /// Joins the workers' chunks.
+    private let assembly = DispatchQueue(label: "ENP.ass.samples", qos: .userInitiated)
     private let lock = NSLock()
     /// Counts changes to the events or the layout, under `lock`. A frame rendered under an
     /// older generation may be out of date.
     private var generationValue = 0
 
-    init?(header: [UInt8], fonts: [ASSFont], videoMatrix: ColorMangling.Matrix?) {
-        guard let renderer = LibassRenderer(header: header, fonts: fonts, videoMatrix: videoMatrix) else { return nil }
-        self.renderer = renderer
+    init?(header: [UInt8], fonts: [ASSFont], videoMatrix: ColorMangling.Matrix?, workerCount: Int = ASSRenderEngine.defaultWorkerCount) {
+        let count = max(1, workerCount)
+        // Font setup takes a moment per renderer, so they are made side by side.
+        let renderers = Mutex([LibassRenderer?](repeating: nil, count: count))
+        DispatchQueue.concurrentPerform(iterations: count) { index in
+            let renderer = LibassRenderer(header: header, fonts: fonts, videoMatrix: videoMatrix)
+            renderers.withLock { $0[index] = renderer }
+        }
+        let made = renderers.withLock { $0 }.compactMap { $0 }
+        guard made.count == count else { return nil }
+        workers = made.enumerated().map { Worker(index: $0.offset, renderer: $0.element) }
     }
 
     var generation: Int { lock.withLock { generationValue } }
 
     func set(layout: LibassRenderer.Layout) {
         bumpGeneration()
-        queue.async { [renderer] in renderer.set(layout: layout) }
+        for worker in workers {
+            worker.queue.async { worker.renderer.set(layout: layout) }
+        }
     }
 
     func add(_ events: [ASSEvent]) {
         guard !events.isEmpty else { return }
         bumpGeneration()
-        queue.async { [renderer] in renderer.add(events) }
+        for worker in workers {
+            worker.queue.async { worker.renderer.add(events) }
+        }
     }
 
-    /// Renders each of `milliseconds` in order and hands the frames, with the generation they
-    /// were rendered under, to `completion` on the main queue.
-    func render(_ milliseconds: [Int64], completion: @escaping @Sendable @MainActor (Int, [ASSRenderedFrame]) -> Void) {
+    /// Renders `frames` (playlist ticks) and makes them into sample buffers for a canvas of
+    /// `width` × `height` pixels, `images[i]` from `frames[i]` and the last one until `end`.
+    /// Hands them, with the generation they were rendered under, to `completion` on the main queue.
+    func renderSamples(_ frames: [Int64], end: Int64, width: Int, height: Int, completion: @escaping @Sendable @MainActor (Int, ASSSamples.Batch) -> Void) {
         let generation = generation
-        queue.async { [self] in
-            let cached = cache.generation == generation ? cache.frames : [:]
-            var frames: [ASSRenderedFrame] = []
-            var kept: [Int64: ASSRenderedFrame] = [:]
-            for time in milliseconds {
-                let frame = cached[time] ?? renderer.render(atMilliseconds: time)
-                frames.append(frame)
-                kept[time] = frame
+        let chunks = ASSSamples.chunks(of: frames, count: workers.count)
+        let results = Mutex([[ASSSamples.Piece]](repeating: [], count: chunks.count))
+        let group = DispatchGroup()
+        for (index, chunk) in chunks.enumerated() {
+            let worker = workers[index]
+            // A chunk's last frame lasts until the next chunk starts.
+            let chunkEnd = index + 1 < chunks.count ? chunks[index + 1][0] : end
+            group.enter()
+            worker.queue.async {
+                let pieces = worker.pieces(chunk, end: chunkEnd, width: width, height: height, generation: generation)
+                results.withLock { $0[index] = pieces }
+                group.leave()
             }
-            cache = (generation, kept)
+        }
+        group.notify(queue: assembly) {
+            let samples = ASSSamples.merged(results.withLock { $0 }).compactMap { piece -> CMSampleBuffer? in
+                guard let sample = piece.sample else { return nil }
+                guard piece.retimed else { return sample }
+                var timing = CMSampleTimingInfo(
+                    duration: CMTime(value: piece.duration, timescale: 10_000_000),
+                    presentationTimeStamp: CMTime(value: piece.start, timescale: 10_000_000),
+                    decodeTimeStamp: .invalid
+                )
+                var retimed: CMSampleBuffer?
+                CMSampleBufferCreateCopyWithNewTiming(allocator: nil, sampleBuffer: sample, sampleTimingEntryCount: 1, sampleTimingArray: &timing, sampleBufferOut: &retimed)
+                return retimed
+            }
+            let batch = ASSSamples.Batch(samples: samples)
             DispatchQueue.main.async {
-                MainActor.assumeIsolated { completion(generation, frames) }
+                MainActor.assumeIsolated { completion(generation, batch) }
             }
         }
     }
@@ -142,21 +294,22 @@ import UIKit
 /// above the video and below the controls. The rendition's WebVTT segments are empty, so
 /// its selection in the player's menu only says what to draw here.
 ///
-/// Timing is left to Core Animation, not to the main thread. The subtitles live in an
-/// `AVSynchronizedLayer`, whose clock is the player item's timebase, the same clock that
-/// presents the video frames. The next second is rendered ahead, one image per video frame
-/// (at the frame times read from the file), and installed as a discrete keyframe animation
-/// keyed at those frame times. The render server switches images on the very vsync the
-/// video frame changes, whatever the main thread is doing, and paused seeks, rate changes
-/// and stalls follow the timebase by themselves.
+/// The subtitles are presented the way the video is: as timed sample buffers in an
+/// `AVSampleBufferDisplayLayer` whose control timebase is the player item's own. Each
+/// rendered frame (at the video's frame times, read from the file) becomes a buffer the
+/// size of the overlay with that frame's presentation time and duration, and the layer's
+/// video queue picks the buffer for each refresh the same way, and against the same clock,
+/// as the video's. No clock is read anywhere else, and seeks, pauses, rate changes and
+/// stalls follow the timebase by themselves.
 @MainActor
 final class ASSSubtitleRenderer {
     /// How far back, in segments, a read looks for events still on screen as a segment starts.
     static let lookback = 3
-    /// How far ahead of the playhead frames are rendered, in ticks.
-    private static let leadTicks: Int64 = 10_000_000
-    /// A new stretch is rendered once less than this much is left of the planned one.
-    private static let refillTicks: Int64 = 6_000_000
+    /// How far ahead of the playhead samples are enqueued, in ticks. Each animated frame is a
+    /// buffer the size of the screen, so this stays short.
+    private static let leadTicks: Int64 = 5_000_000
+    /// More samples are rendered once less than this much is left of the enqueued ones.
+    private static let refillTicks: Int64 = 3_000_000
 
     private let session: EnhancedPlaybackSession
     private let overlay = ASSOverlayView()
@@ -173,8 +326,12 @@ final class ASSSubtitleRenderer {
     private var setupTask: Task<Void, Never>?
     private var loads: [Int: Task<Void, Never>] = [:]
     private var segments: [Int: ASSSegment] = [:]
-    /// The stretch the installed animation covers, in playlist ticks, and the generation it was rendered under.
-    private var planned: (start: Int64, end: Int64, generation: Int)?
+    /// The enqueued samples run from `start` to `end` (playlist ticks), rendered under `generation`.
+    private var enqueued: (start: Int64, end: Int64, generation: Int)?
+    /// Changes whenever the enqueued samples are thrown away, so a render begun before can tell.
+    private var epoch = 0
+    /// The playhead at the last plan, in playlist ticks.
+    private var lastPlanned: Int64?
     private var rendering = false
     private var needsPlan = false
 
@@ -192,7 +349,6 @@ final class ASSSubtitleRenderer {
         detach()
         self.player = player
         self.item = item
-        overlay.attach(item)
         selectionObserver = NotificationCenter.default.addObserver(forName: AVPlayerItem.mediaSelectionDidChangeNotification, object: item, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.updateSelection(of: item) }
         }
@@ -217,7 +373,6 @@ final class ASSSubtitleRenderer {
         jumpObserver = nil
         presentationSizeObservation = nil
         select(track: nil)
-        overlay.attach(nil)
         player = nil
         item = nil
     }
@@ -241,15 +396,15 @@ final class ASSSubtitleRenderer {
         loads = [:]
         segments = [:]
         engine = nil
-        planned = nil
+        discardSamples()
         rendering = false
         needsPlan = false
         if let timeObserver { player?.removeTimeObserver(timeObserver) }
         timeObserver = nil
-        overlay.clear()
+        overlay.attach(timebase: nil)
         // A new engine has no layout yet.
         overlay.layout = nil
-        guard let track, let player else { return }
+        guard let track, let player, let item else { return }
         Logger.player.info("Drawing ASS track \(track) with libass")
         let header = session.assHeader(track: track)
         let matrix = session.videoColorMatrix
@@ -266,17 +421,23 @@ final class ASSSubtitleRenderer {
             let engine = await Task.detached(priority: .userInitiated) {
                 ASSRenderEngine(header: header, fonts: fonts, videoMatrix: matrix)
             }.value
-            guard let self, !Task.isCancelled, self.selection == selection else { return }
+            guard let self, !Task.isCancelled, self.selection == selection, self.item === item else { return }
             guard let engine else {
                 Logger.player.error("libass could not be initialised for track \(track)")
                 return
             }
+            // The item has a timebase once it has a player; the selection can't exist before that.
+            guard let timebase = item.timebase else {
+                Logger.player.error("The player item has no timebase to show ASS track \(track) on")
+                return
+            }
             Logger.player.info("libass ready for track \(track) with \(fonts.count) attached fonts")
             self.engine = engine
+            self.overlay.attach(timebase: timebase)
             for segment in self.segments.values { engine.add(segment.events) }
             self.updateLayout()
-            // Only to keep the planned stretch ahead of the playhead; the timing itself is the layer's.
-            self.timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(value: 1, timescale: 4), queue: .main) { [weak self] _ in
+            // Only to keep samples enqueued ahead of the playhead; which one shows is the layer's.
+            self.timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(value: 1, timescale: 8), queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated { self?.plan() }
             }
             self.plan()
@@ -301,54 +462,92 @@ final class ASSSubtitleRenderer {
         )
         guard layout != overlay.layout else { return }
         overlay.layout = layout
-        overlay.scale = scale
         engine.set(layout: layout)
         plan()
     }
 
-    /// A seek or a stall moved the playhead. If it left the planned stretch, the installed
-    /// images are for other frames, so they go before anything wrong is shown.
+    /// Throws the enqueued samples away, and the image on screen with them.
+    private func discardSamples() {
+        epoch += 1
+        enqueued = nil
+        lastPlanned = nil
+        overlay.flush()
+    }
+
+    /// A seek or a stall moved the playhead. The layer drops samples once it has shown them,
+    /// so unless the playhead only moved forward inside the enqueued stretch, everything is
+    /// enqueued again from the new place.
     private func timeJumped() {
-        guard let item, let planned else { return plan() }
+        guard let item, let enqueued else { return plan() }
         let now = Self.ticks(item.currentTime())
-        if now < planned.start || now >= planned.end {
-            overlay.clear()
-            self.planned = nil
-        }
+        if now < (lastPlanned ?? enqueued.start) || now >= enqueued.end { discardSamples() }
         plan()
     }
 
-    /// Renders and installs the stretch from the frame on screen to `leadTicks` ahead, unless
-    /// the installed one still reaches far enough.
+    /// Enqueues samples from where the enqueued ones end, or from the frame on screen, to
+    /// `leadTicks` ahead. New events or a new layout make the enqueued ones stale: they are
+    /// replaced from the frame on screen.
     private func plan() {
-        guard let engine, let track, let item, player?.currentItem === item else { return }
+        guard let engine, let track, let item, player?.currentItem === item, let layout = overlay.layout else { return }
         let time = item.currentTime()
         guard time.isNumeric else { return }
         let now = Self.ticks(time)
+        lastPlanned = now
         loadAround(track: track, segment: session.subtitleSegment(atTicks: now))
         let generation = engine.generation
-        if let planned, planned.generation == generation, planned.start <= now, planned.end - now > Self.refillTicks { return }
+        let target = now + Self.leadTicks
+        var from = now
+        var replacing = true
+        if let enqueued, enqueued.generation == generation, enqueued.start <= now, now < enqueued.end {
+            if enqueued.end - now > Self.refillTicks { return }
+            from = enqueued.end
+            replacing = false
+        } else if let enqueued, enqueued.generation == generation, !rendering, now >= enqueued.end, now - enqueued.end < Self.leadTicks {
+            // Played past everything enqueued: the last image has been held over frames it doesn't belong to.
+            Logger.player.warning("ASS: subtitles ran out \((now - enqueued.end) / 10_000) ms ago; rendering can't keep up")
+        }
         guard !rendering else {
             needsPlan = true
             return
         }
         // Without the segments' frame times there are no events either; their load plans again.
-        guard let frames = frameTimes(from: now, to: now + Self.leadTicks), !frames.isEmpty else { return }
+        // The last frame only closes the stretch; samples run up to it.
+        guard let frames = frameTimes(from: from, to: target), frames.count >= 2 else { return }
+        if !replacing, frames[0] != from {
+            // The enqueued stretch ends on a frame start, so this only happens with frames from the rate.
+            return discardAndPlan()
+        }
         rendering = true
         let selection = selection
-        let end = now + Self.leadTicks
-        engine.render(frames.map(ASSTime.milliseconds(ticks:))) { [weak self] rendered, images in
+        let epoch = epoch
+        let end = frames[frames.count - 1]
+        let started = ContinuousClock.now
+        engine.renderSamples(Array(frames.dropLast()), end: end, width: layout.frameWidth, height: layout.frameHeight) { [weak self] rendered, batch in
             guard let self, self.selection == selection else { return }
             self.rendering = false
-            if rendered == self.engine?.generation {
-                self.overlay.install(frames: frames, images: images, end: end)
-                self.planned = (frames[0], end, rendered)
+            let took = ContinuousClock.now - started
+            let span = Duration.nanoseconds((end - frames[0]) * 100)
+            if took > span {
+                Logger.player.warning("ASS: rendering \(span) of subtitles took \(took), slower than playback")
+            }
+            // A seek since the render began threw away what these samples follow on from.
+            if rendered == self.engine?.generation, self.epoch == epoch {
+                // Stale samples go, but the image on screen stays until the new ones take over.
+                if replacing { self.overlay.flush(keepingImage: true) }
+                self.overlay.enqueue(batch.samples)
+                let start = replacing ? frames[0] : (self.enqueued?.start ?? frames[0])
+                self.enqueued = (start, end, rendered)
             }
             if self.needsPlan || rendered != self.engine?.generation {
                 self.needsPlan = false
                 self.plan()
             }
         }
+    }
+
+    private func discardAndPlan() {
+        discardSamples()
+        plan()
     }
 
     /// The frame on screen at `start` and every frame after it up to `end`, nil while a
@@ -418,54 +617,58 @@ final class ASSSubtitleRenderer {
     }
 }
 
-/// Hosts the `AVSynchronizedLayer` the subtitle images are animated in.
+/// Hosts the `AVSampleBufferDisplayLayer` the subtitle samples are presented in.
 private final class ASSOverlayView: UIView {
-    private var syncLayer: AVSynchronizedLayer?
-    private let imageLayer = CALayer()
-    var scale: CGFloat = 1
+    private var displayLayer: AVSampleBufferDisplayLayer?
     var layout: LibassRenderer.Layout?
     var onLayout: (() -> Void)?
 
-    func attach(_ item: AVPlayerItem?) {
+    /// A new layer on `timebase`, or none.
+    func attach(timebase: CMTimebase?) {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        syncLayer?.removeFromSuperlayer()
-        imageLayer.removeAllAnimations()
-        imageLayer.removeFromSuperlayer()
-        syncLayer = nil
-        if let item {
-            let syncLayer = AVSynchronizedLayer(playerItem: item)
-            syncLayer.frame = bounds
-            imageLayer.anchorPoint = .zero
-            imageLayer.contentsGravity = .resize
-            syncLayer.addSublayer(imageLayer)
-            layer.addSublayer(syncLayer)
-            self.syncLayer = syncLayer
+        displayLayer?.flushAndRemoveImage()
+        displayLayer?.removeFromSuperlayer()
+        displayLayer = nil
+        if let timebase {
+            let displayLayer = AVSampleBufferDisplayLayer()
+            displayLayer.frame = bounds
+            // The samples are exactly the overlay's size in pixels.
+            displayLayer.videoGravity = .resize
+            displayLayer.isOpaque = false
+            displayLayer.backgroundColor = nil
+            displayLayer.controlTimebase = timebase
+            layer.addSublayer(displayLayer)
+            self.displayLayer = displayLayer
         }
         CATransaction.commit()
         layout = nil
     }
 
-    func clear() {
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        imageLayer.removeAllAnimations()
-        CATransaction.commit()
+    func flush(keepingImage: Bool = false) {
+        guard let displayLayer else { return }
+        if keepingImage {
+            displayLayer.flush()
+        } else {
+            displayLayer.flushAndRemoveImage()
+        }
+        // A layer that failed takes no more samples until flushed.
+        if displayLayer.status == .failed {
+            Logger.player.warning("ASS sample layer failed: \(String(describing: displayLayer.error))")
+        }
     }
 
-    func install(frames: [Int64], images: [ASSRenderedFrame], end: Int64) {
-        guard let group = ASSKeyframes.animation(frames: frames, images: images, end: end, scale: scale) else { return }
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        imageLayer.add(group, forKey: "ass")
-        CATransaction.commit()
+    func enqueue(_ samples: [CMSampleBuffer]) {
+        guard let displayLayer else { return }
+        if displayLayer.status == .failed { displayLayer.flush() }
+        for sample in samples { displayLayer.enqueue(sample) }
     }
 
     override func layoutSubviews() {
         super.layoutSubviews()
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        syncLayer?.frame = bounds
+        displayLayer?.frame = bounds
         CATransaction.commit()
         onLayout?()
     }

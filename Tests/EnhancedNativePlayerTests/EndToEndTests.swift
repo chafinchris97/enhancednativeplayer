@@ -396,11 +396,11 @@ struct EndToEndTests {
         await session.stop()
     }
 
-    /// Files with ASS subtitles: in an `AVSynchronizedLayer` on the player's item, the
-    /// subtitle image changes at exactly the item time the video frame does. At every frame
-    /// around a few events' starts and ends, a paused seek lands on the frame's first instant
-    /// and on the instant before it, and the layer must show that frame's image, while the
-    /// video output reports the same frame.
+    /// Files with ASS subtitles: the samples the subtitle layer is given switch image at
+    /// exactly the item time the video frame does. At every frame around a few events'
+    /// starts and ends, a paused seek lands on the frame's first instant and on the instant
+    /// before it; the video output must report that frame, and the sample covering that
+    /// instant must carry that frame's image.
     @MainActor
     @Test func assImagesSwitchOnTheVideoFrame() async throws {
         let session = try await EnhancedPlaybackSession.start(url: source)
@@ -418,19 +418,6 @@ struct EndToEndTests {
         let player = AVPlayer(playerItem: item)
         player.isMuted = true
         try await waitUntil(timeout: 20) { item.status != .unknown }
-        // A synchronized layer only follows the item once it is in a rendered layer tree.
-        let sync = AVSynchronizedLayer(playerItem: item)
-        let layer = CALayer()
-        layer.anchorPoint = .zero
-        sync.addSublayer(layer)
-        #if canImport(AppKit)
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 960, height: 540), styleMask: [.titled], backing: .buffered, defer: false)
-        window.contentView?.wantsLayer = true
-        sync.frame = CGRect(x: 0, y: 0, width: 960, height: 540)
-        window.contentView?.layer?.addSublayer(sync)
-        window.orderFrontRegardless()
-        #endif
-
         // Events from a middle segment, so the check isn't only at the start of the file.
         let middle = session.subtitleSegment(atTicks: Int64(session.duration * 10_000_000)) / 2
         var segment = try await session.assSegment(track: track, segment: middle)
@@ -453,23 +440,19 @@ struct EndToEndTests {
                 guard let at = frames.firstIndex(where: { $0 >= edge * 10_000 }), at >= 2, at + 3 < frames.count else { continue }
                 let window = Array(frames[(at - 2)...(at + 2)])
                 let images = window.map { renderer.render(atMilliseconds: ASSTime.milliseconds(ticks: $0)) }
-                let animation = try #require(ASSKeyframes.animation(frames: window, images: images, end: frames[at + 3], scale: 1))
-                layer.removeAllAnimations()
-                layer.add(animation, forKey: "ass")
-                CATransaction.flush()
-                for (frame, image) in zip(window, images).dropFirst() {
-                    let expected = image.image ?? ASSKeyframes.empty
-                    let previous = window[window.firstIndex(of: frame)! - 1]
-                    let expectedBefore = images[window.firstIndex(of: previous)!].image ?? ASSKeyframes.empty
+                let runs = ASSSamples.runs(frames: window, images: images, end: frames[at + 3])
+                func sampleImage(at time: Int64) -> CGImage? {
+                    runs.first { $0.start <= time && time < $0.start + $0.duration }.flatMap { images[$0.index].image }
+                }
+                for (index, frame) in window.enumerated().dropFirst() {
+                    let previous = window[index - 1]
                     // The frame's first instant, and the last 0.5 ms of the frame before.
-                    for (time, wanted) in [(frame, expected), (frame - 5_000, expectedBefore)] {
+                    for (time, videoFrame, wanted) in [(frame, frame, images[index]), (frame - 5_000, previous, images[index - 1])] {
                         await player.seek(to: CMTime(value: time, timescale: 10_000_000), toleranceBefore: .zero, toleranceAfter: .zero)
                         try await Task.sleep(for: .milliseconds(150))
-                        let shown = layer.presentation()?.contents as! CGImage?
-                        #expect(shown === wanted, "subtitle image at \(time) (frame \(frame)) for edge \(edge) ms")
+                        #expect(sampleImage(at: time) === wanted.image, "subtitle sample at \(time) (frame \(frame)) for edge \(edge) ms")
                         var display = CMTime.invalid
                         if output.copyPixelBuffer(forItemTime: CMTime(value: time, timescale: 10_000_000), itemTimeForDisplay: &display) != nil {
-                            let videoFrame = time == frame ? frame : previous
                             #expect(abs(Int64(display.seconds * 10_000_000) - videoFrame) <= 5_000, "video frame at \(time) is \(display.seconds)")
                         }
                         checked += 1
@@ -477,7 +460,7 @@ struct EndToEndTests {
                 }
             }
         }
-        print("ASS: checked \(checked) frame edges against the synchronized layer")
+        print("ASS: checked \(checked) frame edges against the video output")
         #expect(checked > 0)
         player.pause()
         await session.stop()
