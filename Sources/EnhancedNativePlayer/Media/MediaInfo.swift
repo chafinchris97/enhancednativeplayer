@@ -109,8 +109,10 @@ enum SubtitleTextFormat: Sendable, Equatable {
 }
 
 struct SubtitleTrack: Sendable {
-    /// Position among the file's subtitle tracks, the `{index}` in `subtitle_{index}.m3u8`.
+    /// Position in the subtitle menu, the `{index}` in `subtitle_{index}.m3u8`: external
+    /// tracks first, then the file's own.
     var index: Int
+    /// -1 for an external track.
     var streamIndex: Int32
     var codecName: String
     var timeBase: Rational
@@ -122,6 +124,10 @@ struct SubtitleTrack: Sendable {
     var textFormat: SubtitleTextFormat?
     /// The codec private data. For ASS this is the script header: script info and styles.
     var extradata: [UInt8] = []
+    /// Set for a track from a separate file, whose whole content is already in memory.
+    var external: ExternalSubtitleContent?
+
+    var isExternal: Bool { external != nil }
 
     /// Drawn by `PGSSubtitleRenderer` instead of going through the playlist.
     var isPGS: Bool { codecName == "hdmv_pgs_subtitle" }
@@ -156,4 +162,6 @@ struct MediaInfo: Sendable {
     var keyframes: KeyframeIndex
     /// End of the video stream in index timestamps.
     var videoEndTimestamp: Int64
+    /// The container's chapters, in seconds of the file's timeline.
+    var chapters: [Chapter] = []
 }

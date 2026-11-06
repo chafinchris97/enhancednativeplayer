@@ -12,6 +12,8 @@ public enum EnhancedPlayerError: Error, LocalizedError, Sendable {
     case unknownAudioTrack(Int)
     case cancelled
     case serverFailedToStart
+    case unsupportedSubtitleFormat(URL)
+    case subtitleTooLarge(URL)
 
     public var errorDescription: String? {
         switch self {
@@ -26,6 +28,8 @@ public enum EnhancedPlayerError: Error, LocalizedError, Sendable {
         case .unknownAudioTrack(let index): "Audio track \(index) does not exist"
         case .cancelled: "Cancelled"
         case .serverFailedToStart: "The local HLS server did not start"
+        case .unsupportedSubtitleFormat(let url): "\(url.lastPathComponent) is not an SRT, WebVTT or ASS file"
+        case .subtitleTooLarge(let url): "\(url.lastPathComponent) is larger than \(ExternalSubtitleLoader.maxBytes >> 20) MB"
         }
     }
 }

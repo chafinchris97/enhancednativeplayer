@@ -5,9 +5,9 @@ import Logging
 /// One playback of one remote file: probe, plan, local HLS server and the remux
 /// pipelines behind it.
 ///
-/// Internal: the only way to play is `EnhancedPlayerViewController`, since PGS and ASS
-/// drawing, forced-subtitle selection, display-mode matching and the SDR fallback all
-/// live there. `stop()` stops the server and deletes every cached file.
+/// Internal: the only way to play is `EnhancedPlayer`, since PGS and ASS drawing,
+/// forced-subtitle selection, display-mode matching and the SDR fallback all live there.
+/// `stop()` stops the server and deletes every cached file.
 final class EnhancedPlaybackSession: Sendable {
     /// `http://127.0.0.1:{port}/master.m3u8`
     let masterPlaylistURL: URL
@@ -23,6 +23,11 @@ final class EnhancedPlaybackSession: Sendable {
     let audioTrackNames: [String]
     /// The `NAME` of each subtitle rendition, in `subtitle_{n}` order.
     let subtitleTrackNames: [String]
+    /// Where the playlist timeline starts in the file's timeline, in seconds. AVPlayer's
+    /// time plus this is the file's time.
+    let originSeconds: TimeInterval
+    /// The container's chapters, in seconds of the file's timeline.
+    let fileChapters: [Chapter]
 
     private let core: PlaybackSessionCore
     private let server: HLSServer
@@ -36,9 +41,12 @@ final class EnhancedPlaybackSession: Sendable {
         self.duration = core.context.plan.segments.reduce(0) { $0 + $1.duration }
         self.audioTrackNames = core.playlists.audioNames()
         self.subtitleTrackNames = core.playlists.subtitleNames()
+        self.originSeconds = Double(core.context.originTicks) / 10_000_000
+        self.fileChapters = core.context.media.chapters
     }
 
-    static func start(url: URL, configuration: EnhancedPlayerConfiguration = .init()) async throws -> EnhancedPlaybackSession {
+    /// - Parameter externalSubtitles: Fetched while the file is probed. One that fails is logged and left out.
+    static func start(url: URL, configuration: EnhancedPlayerConfiguration = .init(), externalSubtitles: [ExternalSubtitle] = []) async throws -> EnhancedPlaybackSession {
         let logger = Logger.player
         let started = Date()
 
@@ -46,6 +54,10 @@ final class EnhancedPlaybackSession: Sendable {
             ?? FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("EnhancedNativePlayer", isDirectory: true)
         let directory = base.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        let headers = configuration.httpHeaders
+        let externalTask = Task { await loadExternalSubtitles(externalSubtitles, headers: headers, logger: logger) }
+        defer { externalTask.cancel() }
 
         let token = CancellationToken()
         let file: RemoteFile
@@ -64,7 +76,13 @@ final class EnhancedPlaybackSession: Sendable {
 
         let core: PlaybackSessionCore
         do {
-            let media = try await runBlocking(label: "ENP.probe") { try MediaProbe.probe(file: file, token: token) }
+            var media = try await runBlocking(label: "ENP.probe") { try MediaProbe.probe(file: file, token: token) }
+            let external = await externalTask.value
+            media.subtitles = externalTracks(external) + media.subtitles.map { track in
+                var track = track
+                track.index += external.count
+                return track
+            }
             let plan = SegmentPlan(
                 keyframes: media.keyframes.timestamps,
                 timeBase: media.keyframes.timeBase,
@@ -76,6 +94,7 @@ final class EnhancedPlaybackSession: Sendable {
                 context: RemuxContext(file: file, media: media, plan: plan, token: token),
                 directory: directory,
                 segmentsAhead: configuration.segmentsAhead,
+                externalFonts: external.flatMap(\.fonts),
                 logger: logger
             )
         } catch {
@@ -95,6 +114,66 @@ final class EnhancedPlaybackSession: Sendable {
             core.shutdown()
             throw error
         }
+    }
+
+    /// Fetches every external subtitle at once. One that fails is logged and left out.
+    private static func loadExternalSubtitles(_ subtitles: [ExternalSubtitle], headers: [String: String], logger: Logger) async -> [LoadedExternalSubtitle] {
+        await withTaskGroup(of: (Int, LoadedExternalSubtitle?).self) { group in
+            for (index, subtitle) in subtitles.enumerated() {
+                group.addTask {
+                    do {
+                        return (index, try await ExternalSubtitleLoader.load(subtitle, headers: headers))
+                    } catch {
+                        logger.warning("External subtitle \(subtitle.url.lastPathComponent) left out: \(error.localizedDescription)")
+                        return (index, nil)
+                    }
+                }
+            }
+            var loaded: [(Int, LoadedExternalSubtitle)] = []
+            for await case let (index, subtitle?) in group { loaded.append((index, subtitle)) }
+            return loaded.sorted { $0.0 < $1.0 }.map(\.1)
+        }
+    }
+
+    private static func externalTracks(_ loaded: [LoadedExternalSubtitle]) -> [SubtitleTrack] {
+        loaded.enumerated().map { index, external in
+            // "pt-BR" → "pt": the menu labels by language.
+            let language = external.subtitle.language.split(whereSeparator: { $0 == "-" || $0 == "_" }).first.map(String.init)
+            var header: [UInt8] = []
+            var codec = "subrip"
+            if case .ass(let scriptHeader, _) = external.content {
+                header = scriptHeader
+                codec = "ass"
+            }
+            return SubtitleTrack(
+                index: index,
+                streamIndex: -1,
+                codecName: codec,
+                timeBase: .ticks,
+                language: language,
+                title: nil,
+                isDefault: false,
+                isForced: external.subtitle.isForced,
+                textFormat: nil,
+                extradata: header,
+                external: external.content
+            )
+        }
+    }
+
+    /// Which tracks the master marks DEFAULT from now on. Set before the player reads it.
+    func setStartSelection(_ selection: StartSelection) {
+        core.startSelection.withLock { $0 = selection }
+    }
+
+    /// The audio track playback starts with for `selection`.
+    func defaultAudioIndex(_ selection: StartSelection) -> Int? {
+        core.playlists.defaultAudioIndex(selection)
+    }
+
+    /// The subtitle track playback starts with for `selection`, nil for none.
+    func defaultSubtitleIndex(_ selection: StartSelection) -> Int? {
+        core.playlists.defaultSubtitleIndex(selection)
     }
 
     /// The PGS track behind a subtitle rendition's name, nil for any other kind of track.
@@ -136,8 +215,23 @@ final class EnhancedPlaybackSession: Sendable {
     }
 
     func assSegment(track: Int, segment: Int) async throws -> ASSSegment {
-        guard segment < core.context.subtitleGrid.count else { return ASSSegment(events: [], frameTicks: []) }
-        return try await core.assEvents.segment(track: core.context.media.subtitles[track], segment: segment)
+        let context = core.context
+        guard segment < context.subtitleGrid.count else { return ASSSegment(events: [], frameTicks: []) }
+        let subtitle = context.media.subtitles[track]
+        if case .ass(_, let events)? = subtitle.external {
+            // Every event that shows in the segment, wherever it starts: the whole script is
+            // in memory, so nothing needs looking back for. ReadOrder drops repeats in libass.
+            let start = context.subtitleGrid.startTicks(of: segment) + context.originTicks
+            let end = context.subtitleGrid.endTicks(of: segment) + context.originTicks
+            let shown = events.filter { $0.startTicks < end && $0.endTicks > start }.compactMap { event -> ASSEvent? in
+                let startMilliseconds = ASSTime.milliseconds(ticks: event.startTicks - context.originTicks)
+                let endMilliseconds = ASSTime.milliseconds(ticks: event.endTicks - context.originTicks)
+                guard endMilliseconds > startMilliseconds else { return nil }
+                return ASSEvent(startMilliseconds: startMilliseconds, durationMilliseconds: endMilliseconds - startMilliseconds, data: event.data)
+            }
+            return ASSSegment(events: shown, frameTicks: [])
+        }
+        return try await core.assEvents.segment(track: subtitle, segment: segment)
     }
 
     /// Start and end of a subtitle segment in playlist ticks.
@@ -146,8 +240,9 @@ final class EnhancedPlaybackSession: Sendable {
         return grid.startTicks(of: segment)..<grid.endTicks(of: segment)
     }
 
+    /// The file's attached fonts and those of external ASS tracks.
     func assFonts() async throws -> [ASSFont] {
-        try await core.assEvents.fonts()
+        try await core.assEvents.fonts() + core.externalFonts
     }
 
     /// The video's coded size in pixels.
@@ -204,11 +299,15 @@ final class PlaybackSessionCore: Sendable {
     private let subtitleCues = SubtitleSegmentCache<[SubtitleCue]>()
     let pgsFrames: PGSFrameStore
     let assEvents: ASSEventStore
+    let externalFonts: [ASSFont]
+    /// Which tracks the master marks DEFAULT.
+    let startSelection = Mutex(StartSelection())
     private let logger: Logger
 
-    init(context: RemuxContext, directory: URL, segmentsAhead: Int, logger: Logger) {
+    init(context: RemuxContext, directory: URL, segmentsAhead: Int, externalFonts: [ASSFont] = [], logger: Logger) {
         self.context = context
         self.directory = directory
+        self.externalFonts = externalFonts
         self.logger = logger
         self.playlists = PlaylistBuilder(media: context.media, plan: context.plan, subtitleGrid: context.subtitleGrid)
         pgsFrames = PGSFrameStore(context: context)
@@ -257,7 +356,7 @@ final class PlaybackSessionCore: Sendable {
         do {
             switch route {
             case .master:
-                return .playlist(playlists.master())
+                return .playlist(playlists.master(start: startSelection.withLock { $0 }))
             case .videoPlaylist:
                 return .playlist(playlists.videoPlaylist())
             case .audioPlaylist(let track):
@@ -280,7 +379,7 @@ final class PlaybackSessionCore: Sendable {
                 return try await serve(index, track: track, from: audio, audio: true)
             case .sdrMaster:
                 guard context.sdrRewriter != nil else { return Response(status: .notFound) }
-                return .playlist(playlists.master(sdr: true))
+                return .playlist(playlists.master(sdr: true, start: startSelection.withLock { $0 }))
             case .sdrVideoPlaylist:
                 guard context.sdrRewriter != nil else { return Response(status: .notFound) }
                 return .playlist(playlists.sdrVideoPlaylist())
@@ -298,6 +397,18 @@ final class PlaybackSessionCore: Sendable {
             case .subtitleSegment(let track, let index):
                 guard context.media.subtitles.indices.contains(track), (0..<context.subtitleGrid.count).contains(index) else { return Response(status: .notFound) }
                 let subtitle = context.media.subtitles[track]
+                if let external = subtitle.external {
+                    guard index == 0 else { return Response(status: .notFound) }
+                    guard case .text(let cues) = external else { return .webVTT(WebVTT.document([])) }
+                    let origin = context.originTicks
+                    let shifted = cues.compactMap { cue -> SubtitleCue? in
+                        var cue = cue
+                        cue.startTicks = max(0, cue.startTicks - origin)
+                        cue.endTicks -= origin
+                        return cue.endTicks > cue.startTicks ? cue : nil
+                    }
+                    return .webVTT(WebVTT.document(shifted))
+                }
                 guard let format = subtitle.textFormat else { return .webVTT(WebVTT.document([])) }
                 let cues = try await subtitleCues.value(track: track, segment: index) {
                     try SubtitleCueReader.read(context: context, track: subtitle, format: format, segment: index)

@@ -12,10 +12,31 @@ struct PlaylistBuilder: Sendable {
 
     // MARK: Master
 
-    func master(sdr: Bool = false) -> String {
+    /// The audio track the master marks DEFAULT: the one asked for, else the container's default, else the first.
+    func defaultAudioIndex(_ start: StartSelection = StartSelection()) -> Int? {
+        if let audio = start.audio, media.audio.indices.contains(audio) { return audio }
+        return media.audio.first(where: \.isDefault)?.index ?? media.audio.first?.index
+    }
+
+    /// The subtitle track the master marks DEFAULT, nil for none.
+    func defaultSubtitleIndex(_ start: StartSelection = StartSelection()) -> Int? {
+        switch start.subtitle {
+        case .off: return nil
+        case .track(let index) where media.subtitles.indices.contains(index): return index
+        default: break
+        }
+        // Matroska's default flag is on unless a muxer clears it, so when every track
+        // carries it nobody chose one and subtitles start off. External tracks carry no flag.
+        // Forced tracks are never the default: they turn on with their audio's language instead.
+        let embedded = media.subtitles.filter { !$0.isExternal && !$0.isForced }
+        let flaggedDefault = embedded.filter(\.isDefault)
+        return flaggedDefault.count == embedded.count && embedded.count > 1 ? nil : flaggedDefault.first?.index
+    }
+
+    func master(sdr: Bool = false, start: StartSelection = StartSelection()) -> String {
         var lines = ["#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-INDEPENDENT-SEGMENTS", ""]
         let names = audioNames()
-        let defaultTrack = media.audio.first(where: \.isDefault)?.index ?? media.audio.first?.index
+        let defaultTrack = defaultAudioIndex(start)
         for track in media.audio {
             // AVFoundation builds an option's displayName (what AVPlayerViewController's
             // audio menu shows) from LANGUAGE and ignores NAME, so the label goes in both.
@@ -36,13 +57,7 @@ struct PlaylistBuilder: Sendable {
 
         let subtitleNames = subtitleNames()
         let subtitleLanguages = subtitleLanguages()
-        // Matroska's default flag is on unless a muxer clears it, so when every track
-        // carries it nobody chose one and subtitles start off.
-        // Forced tracks are never the default: they turn on with their audio's language instead.
-        let flaggedDefault = media.subtitles.filter { $0.isDefault && !$0.isForced }
-        let unforced = media.subtitles.filter { !$0.isForced }.count
-        let defaultSubtitle = flaggedDefault.count == unforced && unforced > 1
-            ? nil : flaggedDefault.first?.index
+        let defaultSubtitle = defaultSubtitleIndex(start)
         for track in media.subtitles {
             let attributes = [
                 "TYPE=SUBTITLES",
@@ -100,18 +115,27 @@ struct PlaylistBuilder: Sendable {
         mediaPlaylist(map: "audio_\(track)_init.mp4") { "audio_\(track)_\($0).mp4" }
     }
 
-    /// Subtitles have their own fixed 10 s segments, independent of the video cuts.
+    /// Subtitles have their own fixed 10 s segments, independent of the video cuts. An external
+    /// track is already whole in memory, so it is one segment as long as the movie.
     func subtitlePlaylist(track: Int) -> String {
+        let external = media.subtitles[track].isExternal
+        let total = Double(subtitleGrid.totalTicks) / 10_000_000
+        let targetDuration = external ? max(1, Int(total.rounded(.up))) : Int(SubtitleGrid.segmentTicks / 10_000_000)
         var lines = [
             "#EXTM3U",
             "#EXT-X-VERSION:7",
-            "#EXT-X-TARGETDURATION:\(SubtitleGrid.segmentTicks / 10_000_000)",
+            "#EXT-X-TARGETDURATION:\(targetDuration)",
             "#EXT-X-MEDIA-SEQUENCE:0",
             "#EXT-X-PLAYLIST-TYPE:VOD",
         ]
-        for index in 0..<subtitleGrid.count {
-            lines.append(String(format: "#EXTINF:%f,", subtitleGrid.duration(of: index)))
-            lines.append("subtitle_\(track)_\(index).vtt")
+        if external {
+            lines.append(String(format: "#EXTINF:%f,", total))
+            lines.append("subtitle_\(track)_0.vtt")
+        } else {
+            for index in 0..<subtitleGrid.count {
+                lines.append(String(format: "#EXTINF:%f,", subtitleGrid.duration(of: index)))
+                lines.append("subtitle_\(track)_\(index).vtt")
+            }
         }
         lines.append("#EXT-X-ENDLIST")
         return lines.joined(separator: "\n") + "\n"
@@ -226,6 +250,18 @@ struct PlaylistBuilder: Sendable {
         var seen = Set<String>()
         return values.filter { seen.insert($0).inserted }
     }
+}
+
+/// Which tracks playback starts with, when the app chose them.
+struct StartSelection: Sendable, Equatable {
+    enum Subtitle: Sendable, Equatable {
+        case off
+        case track(Int)
+    }
+
+    var audio: Int?
+    /// Nil: the file's default.
+    var subtitle: Subtitle?
 }
 
 enum Languages {

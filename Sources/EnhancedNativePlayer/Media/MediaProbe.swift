@@ -76,8 +76,28 @@ enum MediaProbe {
                 usesDecodeTimestamps: usesDTS,
                 presentationOffset: presentationOffset
             ),
-            videoEndTimestamp: end
+            videoEndTimestamp: end,
+            chapters: chapters(ctx)
         )
+    }
+
+    /// Matroska editions and MP4 chapter tracks, as libavformat reads them with the header.
+    private static func chapters(_ ctx: UnsafeMutablePointer<AVFormatContext>) -> [Chapter] {
+        guard let list = ctx.pointee.chapters else { return [] }
+        var chapters: [Chapter] = []
+        for i in 0..<Int(ctx.pointee.nb_chapters) {
+            guard let chapter = list[i] else { continue }
+            let timeBase = Rational(chapter.pointee.time_base)
+            guard timeBase.isValid else { continue }
+            var title = ""
+            if let entry = av_dict_get(chapter.pointee.metadata, "title", nil, 0), let value = entry.pointee.value {
+                title = String(cString: value)
+            }
+            let start = timeBase.doubleValue * Double(chapter.pointee.start)
+            let end = chapter.pointee.end > chapter.pointee.start ? timeBase.doubleValue * Double(chapter.pointee.end) : nil
+            chapters.append(Chapter(title: title.isEmpty ? "Chapter \(i + 1)" : title, start: start, end: end))
+        }
+        return chapters.sorted { $0.start < $1.start }
     }
 
     private static func videoTrack(_ stream: UnsafeMutablePointer<AVStream>, index: Int32) throws -> VideoTrack {

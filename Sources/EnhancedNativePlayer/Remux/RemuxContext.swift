@@ -42,6 +42,12 @@ final class RemuxContext: Sendable {
         self.timeline = Timeline(videoTimeBase: media.keyframes.timeBase, originPresentation: plan.origin + presentationShift(media))
     }
 
+    /// Where the playlist timeline starts in the file's timeline, in 100 ns ticks. A time in
+    /// the file minus this is the same moment in the playlist, which is what AVPlayer reports.
+    var originTicks: Int64 {
+        timeline.videoTimeBase.rescaleNearest(timeline.originPresentation, to: .ticks)
+    }
+
     /// Presentation time (video time base) at which segment `index` starts.
     func presentationStart(of index: Int) -> Int64 {
         plan.segments[index].start + presentationShift(media)
