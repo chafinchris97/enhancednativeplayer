@@ -1,6 +1,10 @@
 @preconcurrency import AVFoundation
 import Foundation
 import ImageIO
+import QuartzCore
+#if canImport(AppKit)
+import AppKit
+#endif
 import Testing
 @testable import EnhancedNativePlayer
 
@@ -323,6 +327,158 @@ struct EndToEndTests {
         NotificationCenter.default.removeObserver(observer)
         let selected = item.currentMediaSelection.selectedMediaOption(in: group)
         #expect(selected?.renditionName.flatMap { session.pgsTrack(named: $0) } == track)
+        player.pause()
+        await session.stop()
+    }
+
+    /// Files with ASS subtitles: events read straight after a seek are what a full pass
+    /// holds, the attached fonts are found, libass draws an event from its first
+    /// millisecond, and choosing the rendition in AVPlayer says which track to draw.
+    @MainActor
+    @Test func assEventsAreRandomAccessAndRender() async throws {
+        let session = try await EnhancedPlaybackSession.start(url: source)
+        guard let track = session.subtitleTrackNames.firstIndex(where: { session.assTrack(named: $0) != nil }) else {
+            await session.stop()
+            return
+        }
+        let header = session.assHeader(track: track)
+        #expect(String(decoding: header, as: UTF8.self).contains("[Script Info]"))
+        let fonts = try await session.assFonts()
+        print("ASS track \(track): \(fonts.count) attached fonts \(fonts.map(\.name))")
+
+        let last = session.subtitleSegment(atTicks: Int64(session.duration * 10_000_000))
+        var full: [ASSEvent] = []
+        var frames: [Int64] = []
+        for segment in 0...last {
+            let read = try await session.assSegment(track: track, segment: segment)
+            full += read.events
+            frames += read.frameTicks
+        }
+        print("ASS track \(track): \(full.count) events, \(frames.count) video frames")
+        #expect(!full.isEmpty)
+        // Every frame once, in order, as the segments tile the timeline.
+        #expect(frames == frames.sorted() && Set(frames).count == frames.count)
+        #expect(Set(full.map(\.data)).count == full.count, "an event landed in two segments")
+
+        // A fresh session has read nothing, so each lookup stands alone.
+        let fresh = try await EnhancedPlaybackSession.start(url: source)
+        for wanted in stride(from: full.count / 2, to: full.count, by: max(1, full.count / 8)) {
+            let event = full[wanted]
+            let segment = fresh.subtitleSegment(atTicks: event.startMilliseconds * 10_000)
+            let events = try await fresh.assSegment(track: track, segment: segment).events
+            #expect(events.contains(event), "event at \(event.startMilliseconds) ms")
+        }
+        await fresh.stop()
+
+        let renderer = try #require(LibassRenderer(header: header, fonts: fonts, videoMatrix: session.videoColorMatrix))
+        let size = session.videoSize
+        renderer.set(layout: .init(frameWidth: Int(size.width), frameHeight: Int(size.height), video: CGRect(origin: .zero, size: size), storageWidth: Int(size.width), storageHeight: Int(size.height)))
+        renderer.add(full)
+        let event = full[full.count / 2]
+        let frame = renderer.render(atMilliseconds: event.startMilliseconds)
+        #expect(frame.image != nil)
+        if let out, let image = frame.image {
+            let url = out.appendingPathComponent("ass_\(event.startMilliseconds).png") as CFURL
+            let destination = try #require(CGImageDestinationCreateWithURL(url, "public.png" as CFString, 1, nil))
+            CGImageDestinationAddImage(destination, image, nil)
+            #expect(CGImageDestinationFinalize(destination))
+        }
+
+        let item = AVPlayerItem(url: session.masterPlaylistURL)
+        let player = AVPlayer(playerItem: item)
+        player.isMuted = true
+        try await waitUntil(timeout: 20) { item.status != .unknown }
+        let group = try #require(try await item.asset.loadMediaSelectionGroup(for: .legible))
+        item.select(group.options[track], in: group)
+        let selected = item.currentMediaSelection.selectedMediaOption(in: group)
+        #expect(selected?.renditionName.flatMap { session.assTrack(named: $0) } == track)
+        player.pause()
+        await session.stop()
+    }
+
+    /// Files with ASS subtitles: in an `AVSynchronizedLayer` on the player's item, the
+    /// subtitle image changes at exactly the item time the video frame does. At every frame
+    /// around a few events' starts and ends, a paused seek lands on the frame's first instant
+    /// and on the instant before it, and the layer must show that frame's image, while the
+    /// video output reports the same frame.
+    @MainActor
+    @Test func assImagesSwitchOnTheVideoFrame() async throws {
+        let session = try await EnhancedPlaybackSession.start(url: source)
+        guard let track = session.subtitleTrackNames.firstIndex(where: { session.assTrack(named: $0) != nil }) else {
+            await session.stop()
+            return
+        }
+        let fonts = try await session.assFonts()
+        let renderer = try #require(LibassRenderer(header: session.assHeader(track: track), fonts: fonts, videoMatrix: session.videoColorMatrix))
+        renderer.set(layout: .init(frameWidth: 960, frameHeight: 540, video: CGRect(x: 0, y: 0, width: 960, height: 540), storageWidth: Int(session.videoSize.width), storageHeight: Int(session.videoSize.height)))
+
+        let item = AVPlayerItem(url: session.masterPlaylistURL)
+        let output = AVPlayerItemVideoOutput(pixelBufferAttributes: nil)
+        item.add(output)
+        let player = AVPlayer(playerItem: item)
+        player.isMuted = true
+        try await waitUntil(timeout: 20) { item.status != .unknown }
+        // A synchronized layer only follows the item once it is in a rendered layer tree.
+        let sync = AVSynchronizedLayer(playerItem: item)
+        let layer = CALayer()
+        layer.anchorPoint = .zero
+        sync.addSublayer(layer)
+        #if canImport(AppKit)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 960, height: 540), styleMask: [.titled], backing: .buffered, defer: false)
+        window.contentView?.wantsLayer = true
+        sync.frame = CGRect(x: 0, y: 0, width: 960, height: 540)
+        window.contentView?.layer?.addSublayer(sync)
+        window.orderFrontRegardless()
+        #endif
+
+        // Events from a middle segment, so the check isn't only at the start of the file.
+        let middle = session.subtitleSegment(atTicks: Int64(session.duration * 10_000_000)) / 2
+        var segment = try await session.assSegment(track: track, segment: middle)
+        var index = middle
+        while segment.events.isEmpty, index < middle + 6 {
+            index += 1
+            segment = try await session.assSegment(track: track, segment: index)
+        }
+        renderer.add(try await session.assSegment(track: track, segment: index - 1).events)
+        renderer.add(segment.events)
+        let next = try await session.assSegment(track: track, segment: index + 1)
+        renderer.add(next.events)
+        let frames = segment.frameTicks + next.frameTicks
+        #expect(!frames.isEmpty, "no video frame times read")
+
+        var checked = 0
+        for event in segment.events.prefix(4) {
+            for edge in [event.startMilliseconds, event.startMilliseconds + event.durationMilliseconds] {
+                // The frames around the edge: two before the first frame at or after it, two after.
+                guard let at = frames.firstIndex(where: { $0 >= edge * 10_000 }), at >= 2, at + 3 < frames.count else { continue }
+                let window = Array(frames[(at - 2)...(at + 2)])
+                let images = window.map { renderer.render(atMilliseconds: ASSTime.milliseconds(ticks: $0)) }
+                let animation = try #require(ASSKeyframes.animation(frames: window, images: images, end: frames[at + 3], scale: 1))
+                layer.removeAllAnimations()
+                layer.add(animation, forKey: "ass")
+                CATransaction.flush()
+                for (frame, image) in zip(window, images).dropFirst() {
+                    let expected = image.image ?? ASSKeyframes.empty
+                    let previous = window[window.firstIndex(of: frame)! - 1]
+                    let expectedBefore = images[window.firstIndex(of: previous)!].image ?? ASSKeyframes.empty
+                    // The frame's first instant, and the last 0.5 ms of the frame before.
+                    for (time, wanted) in [(frame, expected), (frame - 5_000, expectedBefore)] {
+                        await player.seek(to: CMTime(value: time, timescale: 10_000_000), toleranceBefore: .zero, toleranceAfter: .zero)
+                        try await Task.sleep(for: .milliseconds(150))
+                        let shown = layer.presentation()?.contents as! CGImage?
+                        #expect(shown === wanted, "subtitle image at \(time) (frame \(frame)) for edge \(edge) ms")
+                        var display = CMTime.invalid
+                        if output.copyPixelBuffer(forItemTime: CMTime(value: time, timescale: 10_000_000), itemTimeForDisplay: &display) != nil {
+                            let videoFrame = time == frame ? frame : previous
+                            #expect(abs(Int64(display.seconds * 10_000_000) - videoFrame) <= 5_000, "video frame at \(time) is \(display.seconds)")
+                        }
+                        checked += 1
+                    }
+                }
+            }
+        }
+        print("ASS: checked \(checked) frame edges against the synchronized layer")
+        #expect(checked > 0)
         player.pause()
         await session.stop()
     }

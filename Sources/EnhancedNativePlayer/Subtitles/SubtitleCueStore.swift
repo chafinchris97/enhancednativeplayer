@@ -44,7 +44,9 @@ enum SubtitlePacketReader {
     private static let marginTicks: Int64 = 10_000_000
 
     /// Calls `body` with each of the segment's packets and its position in the playlist timeline.
-    static func forEachPacket(context: RemuxContext, track: SubtitleTrack, segment: Int, body: (Packet, Int64) throws -> Void) throws {
+    /// Where the read walks the video too (Matroska), `videoFrame` gets the position of each
+    /// video frame that starts in the segment, in demux order.
+    static func forEachPacket(context: RemuxContext, track: SubtitleTrack, segment: Int, videoFrame: ((Int64) -> Void)? = nil, body: (Packet, Int64) throws -> Void) throws {
         let grid = context.subtitleGrid
         let start = grid.startTicks(of: segment)
         let end = grid.endTicks(of: segment)
@@ -68,7 +70,9 @@ enum SubtitlePacketReader {
             let ts = packet.pts != FF.noPTS ? packet.pts : packet.dts
             guard ts != FF.noPTS else { continue }
             if packet.streamIndex == video.streamIndex {
-                if video.timeBase.rescaleNearest(ts, to: .ticks) - originTicks >= stop { break }
+                let position = video.timeBase.rescaleNearest(ts, to: .ticks) - originTicks
+                if position >= stop { break }
+                if position >= start, position < end { videoFrame?(position) }
                 continue
             }
             guard packet.streamIndex == track.streamIndex else { continue }

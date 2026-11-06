@@ -120,9 +120,14 @@ struct SubtitleTrack: Sendable {
     var isForced: Bool
     /// Nil for ASS and bitmap subtitles, whose segments stay empty.
     var textFormat: SubtitleTextFormat?
+    /// The codec private data. For ASS this is the script header: script info and styles.
+    var extradata: [UInt8] = []
 
     /// Drawn by `PGSSubtitleRenderer` instead of going through the playlist.
     var isPGS: Bool { codecName == "hdmv_pgs_subtitle" }
+
+    /// Drawn by `ASSSubtitleRenderer` with libass instead of going through the playlist.
+    var isASS: Bool { codecName == "ass" || codecName == "ssa" }
 }
 
 /// Every video keyframe of the file, read from the container index.

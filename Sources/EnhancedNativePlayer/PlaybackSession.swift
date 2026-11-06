@@ -122,6 +122,53 @@ final class EnhancedPlaybackSession: Sendable {
 
     var hasPGSTracks: Bool { core.context.media.subtitles.contains(where: \.isPGS) }
 
+    var hasASSTracks: Bool { core.context.media.subtitles.contains(where: \.isASS) }
+
+    /// The ASS track behind a subtitle rendition's name, nil for any other kind of track.
+    func assTrack(named name: String) -> Int? {
+        guard let track = subtitleTrackNames.firstIndex(of: name), core.context.media.subtitles[track].isASS else { return nil }
+        return track
+    }
+
+    /// The script header of an ASS track: script info and styles.
+    func assHeader(track: Int) -> [UInt8] {
+        core.context.media.subtitles[track].extradata
+    }
+
+    func assSegment(track: Int, segment: Int) async throws -> ASSSegment {
+        guard segment < core.context.subtitleGrid.count else { return ASSSegment(events: [], frameTicks: []) }
+        return try await core.assEvents.segment(track: core.context.media.subtitles[track], segment: segment)
+    }
+
+    /// Start and end of a subtitle segment in playlist ticks.
+    func subtitleSegmentRange(_ segment: Int) -> Range<Int64> {
+        let grid = core.context.subtitleGrid
+        return grid.startTicks(of: segment)..<grid.endTicks(of: segment)
+    }
+
+    func assFonts() async throws -> [ASSFont] {
+        try await core.assEvents.fonts()
+    }
+
+    /// The video's coded size in pixels.
+    var videoSize: CGSize {
+        CGSize(width: core.context.media.video.width, height: core.context.media.video.height)
+    }
+
+    /// The length of one video frame in 100 ns ticks, nil unless the video has a standard
+    /// constant rate. The demuxer's average rate is often a little off (23.98 for 24000/1001),
+    /// and frame starts are counted from 0, so only the exact rate keeps a 2 h film on its frames.
+    var videoFrameTicks: Double? {
+        ASSTime.frameTicks(forRate: core.context.media.video.frameRate)
+    }
+
+    /// The matrix the video's YCbCr is in, for ASS colour mangling. Nil for HDR.
+    var videoColorMatrix: ColorMangling.Matrix? {
+        let video = core.context.media.video
+        guard !video.isHDR else { return nil }
+        return video.height > 576 ? .bt709 : .bt601
+    }
+
     /// The subtitle segment holding a position in the playlist timeline.
     func subtitleSegment(atTicks ticks: Int64) -> Int {
         min(max(0, Int(ticks / SubtitleGrid.segmentTicks)), core.context.subtitleGrid.count - 1)
@@ -156,6 +203,7 @@ final class PlaybackSessionCore: Sendable {
     private let inits = InitSegmentStore()
     private let subtitleCues = SubtitleSegmentCache<[SubtitleCue]>()
     let pgsFrames: PGSFrameStore
+    let assEvents: ASSEventStore
     private let logger: Logger
 
     init(context: RemuxContext, directory: URL, segmentsAhead: Int, logger: Logger) {
@@ -164,6 +212,7 @@ final class PlaybackSessionCore: Sendable {
         self.logger = logger
         self.playlists = PlaylistBuilder(media: context.media, plan: context.plan, subtitleGrid: context.subtitleGrid)
         pgsFrames = PGSFrameStore(context: context)
+        assEvents = ASSEventStore(context: context)
         video = SegmentPipeline(
             name: "video",
             directory: directory.appendingPathComponent("video", isDirectory: true),

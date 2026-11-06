@@ -196,7 +196,9 @@ enum MediaProbe {
                 title: stream.metadata("title"),
                 isDefault: stream.pointee.disposition & AV_DISPOSITION_DEFAULT != 0,
                 isForced: stream.pointee.disposition & AV_DISPOSITION_FORCED != 0,
-                textFormat: format
+                textFormat: format,
+                // mkvmerge compresses the header along with the blocks when it compresses a track.
+                extradata: MatroskaCompression.inflated(par.extradataBytes)
             ))
         }
         return tracks

@@ -21,6 +21,8 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-nio", from: "2.80.0"),
         .package(url: "https://github.com/apple/swift-nio-transport-services", from: "1.28.0"),
         .package(url: "https://github.com/swift-server/swift-service-lifecycle", from: "2.6.0"),
+        // libass 0.17 with FreeType, HarfBuzz and FriBidi as static xcframeworks, tvOS slices included.
+        .package(url: "https://github.com/mihai8804858/swift-libass", from: "1.4.0"),
     ],
     targets: [
         .target(
@@ -36,7 +38,10 @@ let package = Package(
                 .product(name: "NIOCore", package: "swift-nio"),
                 .product(name: "NIOTransportServices", package: "swift-nio-transport-services"),
                 .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"),
-            ]
+                .product(name: "SwiftLibass", package: "swift-libass"),
+            ],
+            // libass finds system fonts through CoreText, which swift-libass doesn't link itself.
+            linkerSettings: [.linkedFramework("CoreText")]
         ),
         .testTarget(
             name: "EnhancedNativePlayerTests",

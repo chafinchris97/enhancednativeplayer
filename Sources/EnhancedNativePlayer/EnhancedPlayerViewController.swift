@@ -33,6 +33,7 @@ public final class EnhancedPlayerViewController: UIViewController {
     private var waitingObservation: NSKeyValueObservation?
     private var errorLogObserver: NSObjectProtocol?
     private var pgsRenderer: PGSSubtitleRenderer?
+    private var assRenderer: ASSSubtitleRenderer?
     private var forcedSubtitles: ForcedSubtitleSelector?
     private var stopped = false
     private var audioSessionActive = false
@@ -113,6 +114,8 @@ public final class EnhancedPlayerViewController: UIViewController {
         errorLogObserver = nil
         pgsRenderer?.stop()
         pgsRenderer = nil
+        assRenderer?.stop()
+        assRenderer = nil
         forcedSubtitles?.stop()
         forcedSubtitles = nil
         player?.pause()
@@ -189,6 +192,11 @@ public final class EnhancedPlayerViewController: UIViewController {
         if session.hasPGSTracks, let overlay = playerViewController.contentOverlayView {
             let renderer = pgsRenderer ?? PGSSubtitleRenderer(session: session, container: overlay)
             pgsRenderer = renderer
+            renderer.attach(player: player, item: item)
+        }
+        if session.hasASSTracks, let overlay = playerViewController.contentOverlayView {
+            let renderer = assRenderer ?? ASSSubtitleRenderer(session: session, container: overlay)
+            assRenderer = renderer
             renderer.attach(player: player, item: item)
         }
 
