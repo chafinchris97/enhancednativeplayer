@@ -1,0 +1,6 @@
+module Libass {
+    header "ass/ass.h"
+    link "c++"
+    link "iconv"
+    export *
+}

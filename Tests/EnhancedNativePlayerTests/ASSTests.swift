@@ -1,6 +1,6 @@
 import CoreGraphics
 import Foundation
-import SwiftLibass
+import Libass
 import Testing
 @testable import EnhancedNativePlayer
 

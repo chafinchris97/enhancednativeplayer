@@ -1,5 +1,5 @@
 {
-  "originHash" : "09e03c05353823ba69b2a91d845f5ff9b29e1a545d90f564eef3dac9103f112e",
+  "originHash" : "15820c2e7c257d996679876e0f7992465fabf12e8fe69b67dabb4fbd135eac85",
   "pins" : [
     {
       "identity" : "async-http-client",
@@ -125,15 +125,6 @@
       "state" : {
         "revision" : "bff4b6903cdc99dda49649dd52f46c11cfd3ed50",
         "version" : "1.8.0"
-      }
-    },
-    {
-      "identity" : "swift-libass",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/mihai8804858/swift-libass",
-      "state" : {
-        "revision" : "6513c488e377a26c06db327fb2acfc2653a041d5",
-        "version" : "1.4.0"
       }
     },
     {

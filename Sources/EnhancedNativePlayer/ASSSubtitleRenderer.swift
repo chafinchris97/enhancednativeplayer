@@ -157,8 +157,9 @@ final class ASSSampleBufferFactory {
 /// of consecutive frames per worker, so heavy typesetting renders on several cores, and
 /// none of it holds up the main thread.
 final class ASSRenderEngine: @unchecked Sendable {
-    /// One libass instance keeps up with the typesetting tested so far. If heavier scripts
-    /// fall behind (the renderer logs it), more workers split each stretch across cores:
+    /// One libass instance keeps up: with its assembly, the heaviest typesetting tested so far
+    /// (full-screen motion-tracked signs at 4K) renders in a few milliseconds a frame. If heavier
+    /// scripts fall behind (the renderer logs it), more workers split each stretch across cores:
     /// `min(4, max(1, ProcessInfo.processInfo.activeProcessorCount - 2))` leaves two for
     /// decoding and the app.
     static var defaultWorkerCount: Int { 1 }
