@@ -329,6 +329,12 @@ final class ASSSubtitleRenderer {
     private var segments: [Int: ASSSegment] = [:]
     /// The enqueued samples run from `start` to `end` (playlist ticks), rendered under `generation`.
     private var enqueued: (start: Int64, end: Int64, generation: Int)?
+    /// The stretch being rendered, in playlist ticks.
+    private var inFlight: Range<Int64>?
+    /// Samples rendered under an engine generation before this one are out of date. Events
+    /// that show nowhere near the enqueued or rendering stretch don't move it, so reading the
+    /// next segment doesn't throw away samples it changes nothing in.
+    private var currentGeneration = 0
     /// Changes whenever the enqueued samples are thrown away, so a render begun before can tell.
     private var epoch = 0
     /// The playhead at the last plan, in playlist ticks.
@@ -399,6 +405,8 @@ final class ASSSubtitleRenderer {
         engine = nil
         discardSamples()
         rendering = false
+        inFlight = nil
+        currentGeneration = 0
         needsPlan = false
         if let timeObserver { player?.removeTimeObserver(timeObserver) }
         timeObserver = nil
@@ -464,6 +472,7 @@ final class ASSSubtitleRenderer {
         guard layout != overlay.layout else { return }
         overlay.layout = layout
         engine.set(layout: layout)
+        currentGeneration = engine.generation
         plan()
     }
 
@@ -495,15 +504,14 @@ final class ASSSubtitleRenderer {
         let now = Self.ticks(time)
         lastPlanned = now
         loadAround(track: track, segment: session.subtitleSegment(atTicks: now))
-        let generation = engine.generation
         let target = now + Self.leadTicks
         var from = now
         var replacing = true
-        if let enqueued, enqueued.generation == generation, enqueued.start <= now, now < enqueued.end {
+        if let enqueued, isCurrent(enqueued.generation), enqueued.start <= now, now < enqueued.end {
             if enqueued.end - now > Self.refillTicks { return }
             from = enqueued.end
             replacing = false
-        } else if let enqueued, enqueued.generation == generation, !rendering, now >= enqueued.end, now - enqueued.end < Self.leadTicks {
+        } else if let enqueued, isCurrent(enqueued.generation), !rendering, now >= enqueued.end, now - enqueued.end < Self.leadTicks {
             // Played past everything enqueued: the last image has been held over frames it doesn't belong to.
             Logger.player.warning("ASS: subtitles ran out \((now - enqueued.end) / 10_000) ms ago; rendering can't keep up")
         }
@@ -519,6 +527,7 @@ final class ASSSubtitleRenderer {
             return discardAndPlan()
         }
         rendering = true
+        inFlight = frames[0]..<frames[frames.count - 1]
         let selection = selection
         let epoch = epoch
         let end = frames[frames.count - 1]
@@ -526,24 +535,42 @@ final class ASSSubtitleRenderer {
         engine.renderSamples(Array(frames.dropLast()), end: end, width: layout.frameWidth, height: layout.frameHeight) { [weak self] rendered, batch in
             guard let self, self.selection == selection else { return }
             self.rendering = false
+            self.inFlight = nil
             let took = ContinuousClock.now - started
             let span = Duration.nanoseconds((end - frames[0]) * 100)
             if took > span {
                 Logger.player.warning("ASS: rendering \(span) of subtitles took \(took), slower than playback")
             }
             // A seek since the render began threw away what these samples follow on from.
-            if rendered == self.engine?.generation, self.epoch == epoch {
+            if self.isCurrent(rendered), self.epoch == epoch {
                 // Stale samples go, but the image on screen stays until the new ones take over.
                 if replacing { self.overlay.flush(keepingImage: true) }
                 self.overlay.enqueue(batch.samples)
                 let start = replacing ? frames[0] : (self.enqueued?.start ?? frames[0])
                 self.enqueued = (start, end, rendered)
             }
-            if self.needsPlan || rendered != self.engine?.generation {
+            if self.needsPlan || !self.isCurrent(rendered) {
                 self.needsPlan = false
                 self.plan()
             }
         }
+    }
+
+    private func isCurrent(_ generation: Int) -> Bool {
+        generation >= currentGeneration
+    }
+
+    /// Adds events to the engine. Only events that show somewhere in the enqueued or
+    /// rendering stretch make those samples out of date.
+    private func add(_ events: [ASSEvent]) {
+        guard let engine, !events.isEmpty else { return }
+        let stretches = [enqueued.map { $0.start..<$0.end }, inFlight].compactMap { $0 }
+        engine.add(events)
+        let touches = events.contains { event in
+            let shown = event.startMilliseconds * 10_000..<(event.startMilliseconds + event.durationMilliseconds) * 10_000
+            return stretches.contains { $0.overlaps(shown) }
+        }
+        if touches { currentGeneration = engine.generation }
     }
 
     private func discardAndPlan() {
@@ -607,7 +634,7 @@ final class ASSSubtitleRenderer {
                 guard let self, self.selection == selection else { return }
                 self.loads[index] = nil
                 self.segments[index] = loaded
-                self.engine?.add(loaded.events)
+                self.add(loaded.events)
                 self.plan()
             }
         }
