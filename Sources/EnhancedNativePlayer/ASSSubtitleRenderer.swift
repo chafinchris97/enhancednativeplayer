@@ -380,6 +380,8 @@ final class ASSSubtitleRenderer {
         jumpObserver = nil
         presentationSizeObservation = nil
         select(track: nil)
+        // The layer runs on this item's timebase, so it goes with the item.
+        overlay.attach(timebase: nil)
         player = nil
         item = nil
     }
@@ -410,7 +412,8 @@ final class ASSSubtitleRenderer {
         needsPlan = false
         if let timeObserver { player?.removeTimeObserver(timeObserver) }
         timeObserver = nil
-        overlay.attach(timebase: nil)
+        // The sample layer stays: discarding the samples has flushed it, image and all, the way a
+        // seek does. A layer made anew while playing showed later samples slightly out of sync.
         // A new engine has no layout yet.
         overlay.layout = nil
         guard let track, let player, let item else { return }
@@ -442,7 +445,7 @@ final class ASSSubtitleRenderer {
             }
             Logger.player.info("libass ready for track \(track) with \(fonts.count) attached fonts")
             self.engine = engine
-            self.overlay.attach(timebase: timebase)
+            if self.overlay.timebase !== timebase { self.overlay.attach(timebase: timebase) }
             for segment in self.segments.values { engine.add(segment.events) }
             self.updateLayout()
             // Only to keep samples enqueued ahead of the playhead; which one shows is the layer's.
@@ -650,6 +653,8 @@ private final class ASSOverlayView: UIView {
     private var displayLayer: AVSampleBufferDisplayLayer?
     var layout: LibassRenderer.Layout?
     var onLayout: (() -> Void)?
+    /// The timebase the layer runs on, nil without a layer.
+    var timebase: CMTimebase? { displayLayer?.controlTimebase }
 
     /// A new layer on `timebase`, or none.
     func attach(timebase: CMTimebase?) {
