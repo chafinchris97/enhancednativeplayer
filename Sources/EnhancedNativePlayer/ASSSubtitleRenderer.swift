@@ -505,6 +505,10 @@ final class ASSSubtitleRenderer {
         let time = item.currentTime()
         guard time.isNumeric else { return }
         let now = Self.ticks(time)
+        // Only a seek moves the playhead back, and the layer has dropped the samples it showed,
+        // so nothing before the playhead is enqueued anymore. The periodic observer can plan at
+        // the new time before the time-jump notification comes, so this can't be left to that.
+        if let lastPlanned, now < lastPlanned { discardSamples() }
         lastPlanned = now
         loadAround(track: track, segment: session.subtitleSegment(atTicks: now))
         let target = now + Self.leadTicks
