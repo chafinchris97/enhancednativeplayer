@@ -92,6 +92,8 @@ public final class EnhancedPlayer {
     #if os(tvOS)
     /// Kept because the view has no window any more by the time it goes away.
     @ObservationIgnored private var displayManager: AVDisplayManager?
+    /// Whether the display switched mode for this session, so leaving switches it back.
+    @ObservationIgnored private var didSwitchDisplay = false
     #endif
 
     // What the view shows around the playback.
@@ -316,6 +318,14 @@ public final class EnhancedPlayer {
         start()
     }
 
+    /// The view is going away. Resets the display mode now, while the view is still on
+    /// screen, and covers the window in black until the switch back starts, so the view
+    /// underneath is not shown in the stream's mode first.
+    func willLeave(_ host: PlayerHostViewController) {
+        guard self.host === host else { return }
+        resetDisplay()
+    }
+
     /// The view went away: end the session.
     func detach(_ host: PlayerHostViewController) {
         guard self.host === host else { return }
@@ -398,16 +408,46 @@ public final class EnhancedPlayer {
             audioSessionActive = false
             try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         }
-        #if os(tvOS)
-        displayManager?.preferredDisplayCriteria = nil
-        displayManager = nil
-        #endif
+        resetDisplay()
         if let session {
             Task { await session.stop() }
         }
         session = nil
         sessionForCleanup.withLock { $0 = nil }
         if status != .failed { status = .idle }
+    }
+
+    /// Clears the display criteria. When the display had switched for the stream and the
+    /// view still has a window, that window stays black until the switch back has ended:
+    /// the start notification comes as soon as the switch is requested, before the TV
+    /// blanks, so the view underneath would still show in the stream's mode.
+    private func resetDisplay() {
+        #if os(tvOS)
+        guard let manager = displayManager else { return }
+        displayManager = nil
+        let window = host?.view.window
+        Logger.player.info("Resetting the display criteria (switched: \(didSwitchDisplay), window: \(window != nil))")
+        guard didSwitchDisplay, let window else {
+            didSwitchDisplay = false
+            manager.preferredDisplayCriteria = nil
+            return
+        }
+        didSwitchDisplay = false
+        let cover = UIView(frame: window.bounds)
+        cover.backgroundColor = .black
+        cover.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        cover.isUserInteractionEnabled = false
+        window.addSubview(cover)
+        let recorder = DisplayModeSwitchRecorder()
+        manager.preferredDisplayCriteria = nil
+        Task { @MainActor in
+            let outcome = try? await DisplayModeSwitch.wait(events: { recorder.events }, startTimeout: .seconds(3), switchTimeout: .seconds(10))
+            let seen = recorder.events.map { "\($0)" }.joined(separator: ", ")
+            Logger.player.info("Display reset: \(outcome.map { "\($0)" } ?? "cancelled") (\(seen)), removing the cover")
+            recorder.invalidate()
+            cover.removeFromSuperview()
+        }
+        #endif
     }
 
     /// Asks for the display mode the stream prefers and waits until the display has
@@ -433,6 +473,7 @@ public final class EnhancedPlayer {
         Logger.player.info("Waiting for the display mode switch")
         let outcome = try await DisplayModeSwitch.wait(events: { recorder.events })
         let seen = recorder.events.map { "\($0)" }.joined(separator: ", ")
+        didSwitchDisplay = outcome != .neverStarted
         switch outcome {
         case .switched: Logger.player.info("Display mode switch ended (\(seen))")
         case .neverStarted: Logger.player.info("No display mode switch started")

@@ -124,6 +124,14 @@ final class PlayerHostViewController: UIViewController {
         player.attach(self)
     }
 
+    /// Leaving starts here, while the view is still on screen. SwiftUI's navigation stack
+    /// sets neither `isMovingFromParent` nor `isBeingDismissed` on a pop, and `dismantle`
+    /// only comes once the view underneath is showing, so any disappearance counts.
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        player.willLeave(self)
+    }
+
     /// A different player was passed to the view.
     func show(_ player: EnhancedPlayer) {
         guard player !== self.player else { return }
