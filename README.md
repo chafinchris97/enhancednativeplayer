@@ -11,7 +11,7 @@ import SwiftUI
 struct MovieView: View {
     @State private var player = EnhancedPlayer(
         url: URL(string: "https://server/movie.mkv")!,
-        headers: ["X-Emby-Token": token],
+        headers: ["Authorization": "Bearer \(token)"],
         subtitles: [ExternalSubtitle(url: URL(string: "https://server/movie.en.srt")!, language: "en")]
     )
 
@@ -30,7 +30,7 @@ struct MovieView: View {
 
 The API has two halves, like `AVPlayer` and `VideoPlayer`:
 
-- **`EnhancedPlayer`** is what plays and how: the URL, headers and external subtitles (init), `play()`, `pause()`, `seek(toSeconds:)`, `stop()`, `selectAudioTrack(index:)`, `selectSubtitleTrack(index:)` and `turnOffSubtitles()`. Each of these works before playback starts and after: before, it says how playback starts (a seek sets the start position, a track choice the starting track); after, it acts at once. Read-only and observable: `status`, `error`, `currentTime`, `duration`, `selectedAudioTrackIndex`, `selectedSubtitleTrackIndex` and `fileChapters`. `avPlayer` is there for observing.
+- **`EnhancedPlayer`** is what plays and how: the URL, headers, external subtitles and trickplay thumbnails (init), `play()`, `pause()`, `seek(toSeconds:)`, `stop()`, `selectAudioTrack(index:)`, `selectSubtitleTrack(index:)` and `turnOffSubtitles()`. Each of these works before playback starts and after: before, it says how playback starts (a seek sets the start position, a track choice the starting track); after, it acts at once. Read-only and observable: `status`, `error`, `currentTime`, `duration`, `selectedAudioTrackIndex`, `selectedSubtitleTrackIndex` and `fileChapters`. `avPlayer` is there for observing.
 - **`EnhancedPlayerView`** shows a player with the system controls, and takes what is shown around the playback as modifiers: `.metadata(title:subtitle:description:artwork:genre:contentRating:releaseDate:)` for the info panel and Now Playing, and `.chapters([...])` to replace the file's own chapters (`[]` for none). Chapters show in the tvOS transport bar; iOS has no chapter UI.
 
 Showing the view starts the session: probe, server, display matching, then playback once `play()` has been called. Removing the view ends it wherever it was shown (a full-screen cover, a sheet, a navigation push): the display mode resets, the server stops and the cache is deleted. The player keeps its position, so showing it again resumes. Keep the player in `@State`: a player created anew each time the parent's body runs would start a new session each time. In UIKit, host the view in a `UIHostingController`.
@@ -38,6 +38,8 @@ Showing the view starts the session: probe, server, display matching, then playb
 Times are seconds in the file's own timeline, which is also the clock a sidecar subtitle file or a server's chapter list uses. Track indices count from 0 in file order. Subtitle indices count external subtitles first, in the order they were passed, then the file's own tracks, the same order as the subtitle menu.
 
 **External subtitles** are SRT, WebVTT or ASS / SSA files, by extension or by their first line. They are fetched with the player's headers while the file is probed, up to 10 MB each, decoded as UTF-8 or UTF-16 by their byte order mark, else UTF-8, else Windows-1252. One that can't be fetched or read is logged and left out; playback goes ahead. SRT and WebVTT become a rendition with one WebVTT segment as long as the movie, since the whole file is already in memory; their cues get the same cleanup as embedded text tracks. An ASS script is split into its header and its `Dialogue` lines, which are rewritten into the Matroska block form, and goes through the libass renderer like an embedded ASS track; `fonts:` adds fonts the script needs.
+
+**Trickplay** thumbnails come from sprite sheets described by a `Trickplay` value: the thumbnail size (`width`, `height`), the grid of a sheet (`tileWidth` across, `tileHeight` down), `interval` (milliseconds each thumbnail stands for), `bandwidth` (the sheets' average bit rate) and every sheet URL in order. How many thumbnails there are follows from those: one per `interval` to the end of the video, as far as the sheets hold. AVPlayer only takes scrubbing thumbnails from an I-frame rendition, so the master lists one (`CODECS="mjpg"`, `iframe.m3u8`) with one entry per second of the movie: `iframe_{n}.mp4` is a Motion JPEG fMP4 fragment holding the thumbnail that shows at that second, cut out of its sheet and stamped on the video's clock, so a thumbnail standing for 10 s is served for 10 consecutive seconds. A sheet is fetched with the player's headers when one of its thumbnails is first asked for, decoded once, and every thumbnail in it encoded as its own JPEG and kept for the session. A description that doesn't add up (no size, layout or interval, or no sheets) is logged and left out. A last sheet holding fewer thumbnails than its grid ends at its last whole one.
 
 `EnhancedPlayerConfiguration` sets the segment duration (`hls_time`, default 6), the look-ahead (default 3 segments), HTTP headers for the source, the cache directory and the source cache budget. The remuxer isn't usable on its own, because PGS and ASS drawing, forced-subtitle selection, display-mode matching and the SDR fallback all depend on the player.
 

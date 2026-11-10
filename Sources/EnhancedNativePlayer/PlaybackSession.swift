@@ -45,8 +45,11 @@ final class EnhancedPlaybackSession: Sendable {
         self.fileChapters = core.context.media.chapters
     }
 
-    /// - Parameter externalSubtitles: Fetched while the file is probed. One that fails is logged and left out.
-    static func start(url: URL, configuration: EnhancedPlayerConfiguration = .init(), externalSubtitles: [ExternalSubtitle] = []) async throws -> EnhancedPlaybackSession {
+    /// - Parameters:
+    ///   - externalSubtitles: Fetched while the file is probed. One that fails is logged and left out.
+    ///   - trickplay: Sprite sheets of thumbnails, served as the master's I-frame rendition.
+    ///     Left out, logged, when its description doesn't add up.
+    static func start(url: URL, configuration: EnhancedPlayerConfiguration = .init(), externalSubtitles: [ExternalSubtitle] = [], trickplay: Trickplay? = nil) async throws -> EnhancedPlaybackSession {
         let logger = Logger.player
         let started = Date()
 
@@ -89,12 +92,23 @@ final class EnhancedPlaybackSession: Sendable {
                 hlsTime: configuration.segmentDuration,
                 end: media.videoEndTimestamp
             )
+            let context = RemuxContext(file: file, media: media, plan: plan, token: token)
+            let trickplayRendition = trickplay.flatMap {
+                TrickplayRendition(
+                    $0,
+                    duration: plan.segments.reduce(0) { $0 + $1.duration },
+                    originSeconds: Double(context.originTicks) / 10_000_000,
+                    headers: headers,
+                    logger: logger
+                )
+            }
             logger.info("Probed \(media.formatName) in \(String(format: "%.0f", Date().timeIntervalSince(started) * 1000)) ms: \(media.keyframes.timestamps.count) keyframes, \(plan.count) segments, \(media.audio.count) audio tracks, \(media.subtitles.count) subtitle tracks")
             core = PlaybackSessionCore(
-                context: RemuxContext(file: file, media: media, plan: plan, token: token),
+                context: context,
                 directory: directory,
                 segmentsAhead: configuration.segmentsAhead,
                 externalFonts: external.flatMap(\.fonts),
+                trickplay: trickplayRendition,
                 logger: logger
             )
         } catch {
@@ -304,12 +318,14 @@ final class PlaybackSessionCore: Sendable {
     let startSelection = Mutex(StartSelection())
     private let logger: Logger
 
-    init(context: RemuxContext, directory: URL, segmentsAhead: Int, externalFonts: [ASSFont] = [], logger: Logger) {
+    init(context: RemuxContext, directory: URL, segmentsAhead: Int, externalFonts: [ASSFont] = [], trickplay: TrickplayRendition? = nil, logger: Logger) {
         self.context = context
         self.directory = directory
         self.externalFonts = externalFonts
         self.logger = logger
-        self.playlists = PlaylistBuilder(media: context.media, plan: context.plan, subtitleGrid: context.subtitleGrid)
+        var playlists = PlaylistBuilder(media: context.media, plan: context.plan, subtitleGrid: context.subtitleGrid)
+        playlists.trickplay = trickplay
+        self.playlists = playlists
         pgsFrames = PGSFrameStore(context: context)
         assEvents = ASSEventStore(context: context)
         video = SegmentPipeline(
@@ -414,6 +430,15 @@ final class PlaybackSessionCore: Sendable {
                     try SubtitleCueReader.read(context: context, track: subtitle, format: format, segment: index)
                 }
                 return .webVTT(WebVTT.document(cues))
+            case .iFramePlaylist:
+                guard let text = playlists.iFramePlaylist() else { return Response(status: .notFound) }
+                return .playlist(text)
+            case .iFrameInit:
+                guard let trickplay = playlists.trickplay else { return Response(status: .notFound) }
+                return .mp4(trickplay.initSegment, audio: false)
+            case .iFrameSegment(let index):
+                guard let trickplay = playlists.trickplay else { return Response(status: .notFound) }
+                return .mp4(try await trickplay.fragment(index), audio: false)
             }
         } catch EnhancedPlayerError.segmentOutOfRange {
             return Response(status: .notFound)

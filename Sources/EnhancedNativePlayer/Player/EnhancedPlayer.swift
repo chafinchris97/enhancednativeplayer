@@ -67,6 +67,7 @@ public final class EnhancedPlayer {
     private let url: URL
     private let configuration: EnhancedPlayerConfiguration
     private let externalSubtitles: [ExternalSubtitle]
+    private let trickplay: Trickplay?
     /// For `deinit`, which can't reach the main actor's state.
     private let sessionForCleanup = Mutex<EnhancedPlaybackSession?>(nil)
 
@@ -106,13 +107,16 @@ public final class EnhancedPlayer {
     ///   - url: Remote file reachable with HTTP range requests.
     ///   - headers: Sent with every request for the file, external subtitles and artwork.
     ///   - subtitles: External subtitle files, listed before the file's own tracks.
+    ///   - trickplay: Sprite sheets of thumbnails for scrubbing.
+    ///     Sheets are fetched with `headers` as they are needed.
     ///   - configuration: Engine tuning. Its headers merge under `headers`.
-    public init(url: URL, headers: [String: String] = [:], subtitles: [ExternalSubtitle] = [], configuration: EnhancedPlayerConfiguration = EnhancedPlayerConfiguration()) {
+    public init(url: URL, headers: [String: String] = [:], subtitles: [ExternalSubtitle] = [], trickplay: Trickplay? = nil, configuration: EnhancedPlayerConfiguration = EnhancedPlayerConfiguration()) {
         var configuration = configuration
         configuration.httpHeaders.merge(headers) { _, new in new }
         self.url = url
         self.configuration = configuration
         self.externalSubtitles = subtitles
+        self.trickplay = trickplay
     }
 
     deinit {
@@ -326,9 +330,9 @@ public final class EnhancedPlayer {
         status = .loading
         error = nil
         Logger.player.info("Opening \(url.lastPathComponent)")
-        startTask = Task { [weak self, url, configuration, externalSubtitles] in
+        startTask = Task { [weak self, url, configuration, externalSubtitles, trickplay] in
             do {
-                let session = try await EnhancedPlaybackSession.start(url: url, configuration: configuration, externalSubtitles: externalSubtitles)
+                let session = try await EnhancedPlaybackSession.start(url: url, configuration: configuration, externalSubtitles: externalSubtitles, trickplay: trickplay)
                 guard let self, !Task.isCancelled else {
                     await session.stop()
                     return

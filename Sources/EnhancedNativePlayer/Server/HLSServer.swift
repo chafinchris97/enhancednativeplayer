@@ -196,10 +196,14 @@ enum HLSRoute: Equatable {
     case sdrVideoSegment(Int)
     case subtitlePlaylist(track: Int)
     case subtitleSegment(track: Int, index: Int)
+    case iFramePlaylist
+    case iFrameInit
+    case iFrameSegment(Int)
 
     /// master.m3u8, video.m3u8, audio_{t}.m3u8, init_video.mp4, video_{n}.mp4,
     /// audio_{t}_init.mp4, audio_{t}_{n}.mp4, master_sdr.m3u8, video_sdr.m3u8,
-    /// init_video_sdr.mp4, video_sdr_{n}.mp4, subtitle_{t}.m3u8, subtitle_{t}_{n}.vtt
+    /// init_video_sdr.mp4, video_sdr_{n}.mp4, subtitle_{t}.m3u8, subtitle_{t}_{n}.vtt,
+    /// iframe.m3u8, init_iframe.mp4, iframe_{n}.mp4
     init?(fileName: String) {
         switch fileName {
         case "master.m3u8": self = .master
@@ -208,6 +212,8 @@ enum HLSRoute: Equatable {
         case "master_sdr.m3u8": self = .sdrMaster
         case "video_sdr.m3u8": self = .sdrVideoPlaylist
         case "init_video_sdr.mp4": self = .sdrVideoInit
+        case "iframe.m3u8": self = .iFramePlaylist
+        case "init_iframe.mp4": self = .iFrameInit
         default:
             if let stem = fileName.dropSuffix(".m3u8"), let track = stem.dropPrefix("audio_").flatMap({ Int($0) }) {
                 self = .audioPlaylist(track: track)
@@ -218,7 +224,9 @@ enum HLSRoute: Equatable {
                 guard parts.count == 2, let track = Int(parts[0]), let index = Int(parts[1]) else { return nil }
                 self = .subtitleSegment(track: track, index: index)
             } else if let stem = fileName.dropSuffix(".mp4") {
-                if let index = stem.dropPrefix("video_sdr_").flatMap({ Int($0) }) {
+                if let index = stem.dropPrefix("iframe_").flatMap({ Int($0) }) {
+                    self = .iFrameSegment(index)
+                } else if let index = stem.dropPrefix("video_sdr_").flatMap({ Int($0) }) {
                     self = .sdrVideoSegment(index)
                 } else if let index = stem.dropPrefix("video_").flatMap({ Int($0) }) {
                     self = .videoSegment(index)

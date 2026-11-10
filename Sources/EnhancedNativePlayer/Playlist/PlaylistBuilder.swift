@@ -6,6 +6,8 @@ struct PlaylistBuilder: Sendable {
     let media: MediaInfo
     let plan: SegmentPlan
     let subtitleGrid: SubtitleGrid
+    /// The thumbnails behind `iframe.m3u8`, nil when the session has none.
+    var trickplay: TrickplayRendition?
 
     static let audioGroup = "audio"
     static let subtitleGroup = "subtitles"
@@ -98,6 +100,37 @@ struct PlaylistBuilder: Sendable {
         if video.emitsDolbyVision, let dv = video.dolbyVision, dv.profile == 8 {
             variant(codec: CodecStrings.baseLayer(video), range: video.range)
         }
+        if let trickplay {
+            let attributes = [
+                "BANDWIDTH=\(trickplay.bandwidth)",
+                "AVERAGE-BANDWIDTH=\(trickplay.averageBandwidth)",
+                "CODECS=\"mjpg\"",
+                "RESOLUTION=\(trickplay.trickplay.width)x\(trickplay.trickplay.height)",
+                "VIDEO-RANGE=SDR",
+                "URI=\"iframe.m3u8\"",
+            ]
+            lines.append("#EXT-X-I-FRAME-STREAM-INF:" + attributes.joined(separator: ","))
+        }
+        return lines.joined(separator: "\n") + "\n"
+    }
+
+    /// One JPEG still per second of the playlist timeline, each its own fragment.
+    func iFramePlaylist() -> String? {
+        guard let trickplay else { return nil }
+        var lines = [
+            "#EXTM3U",
+            "#EXT-X-VERSION:7",
+            "#EXT-X-TARGETDURATION:1",
+            "#EXT-X-MEDIA-SEQUENCE:0",
+            "#EXT-X-PLAYLIST-TYPE:VOD",
+            "#EXT-X-I-FRAMES-ONLY",
+            "#EXT-X-MAP:URI=\"init_iframe.mp4\"",
+        ]
+        for index in 0..<trickplay.entryCount {
+            lines.append(String(format: "#EXTINF:%f,", trickplay.entryDuration(index)))
+            lines.append("iframe_\(index).mp4")
+        }
+        lines.append("#EXT-X-ENDLIST")
         return lines.joined(separator: "\n") + "\n"
     }
 
