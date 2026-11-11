@@ -13,6 +13,7 @@ import Foundation
 /// descriptions, so they combine with this init whichever run produced them.
 enum InitSegmentBuilder {
     static func video(_ context: RemuxContext, rewriter: SDRBitstreamRewriter? = nil, token: CancellationToken) throws -> Data {
+        if context.media.video.rendered != nil { return try PlaceholderVideo.initSegment(context) }
         let video = rewriter == nil ? context.media.video : context.media.video.sdrVariant
         let demuxer = try Demuxer(file: context.file, token: token)
         demuxer.discardAll(except: [video.streamIndex])

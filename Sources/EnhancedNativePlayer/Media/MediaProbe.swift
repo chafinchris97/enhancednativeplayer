@@ -46,7 +46,7 @@ enum MediaProbe {
         }
 
         var video = try videoTrack(videoStream, index: videoIndex)
-        if video.codec == .hevc, let record = firstSample.withUnsafeBufferPointer({ HEVCConfigurationRecord.filling(video.extradata, from: $0) }) {
+        if video.codec == .hevc, video.rendered == nil, let record = firstSample.withUnsafeBufferPointer({ HEVCConfigurationRecord.filling(video.extradata, from: $0) }) {
             video.extradata = record
         }
         let tb = video.timeBase
@@ -102,11 +102,14 @@ enum MediaProbe {
 
     private static func videoTrack(_ stream: UnsafeMutablePointer<AVStream>, index: Int32) throws -> VideoTrack {
         let par = stream.codecpar
+        let codecID = par.pointee.codec_id
+        let pixelFormat = AVPixelFormat(rawValue: par.pointee.format)
+        let route = VideoRoute.route(codecID: codecID, pixelFormat: pixelFormat, profile: par.pointee.profile, decoderAvailable: VideoRoute.decoder(for: codecID) != nil)
         let codec: VideoCodec
-        switch par.pointee.codec_id {
-        case AV_CODEC_ID_H264: codec = .h264
-        case AV_CODEC_ID_HEVC: codec = .hevc
-        default: throw EnhancedPlayerError.unsupportedVideoCodec(codecName(par.pointee.codec_id))
+        switch route {
+        case .copy(let copied): codec = copied
+        case .render: return renderedVideoTrack(stream, index: index)
+        case .unsupported: throw EnhancedPlayerError.unsupportedVideoCodec(codecName(codecID))
         }
 
         var dolbyVision: DolbyVisionConfiguration?
@@ -138,7 +141,7 @@ enum MediaProbe {
             }
         }
 
-        let rate = Rational(stream.pointee.avg_frame_rate).isValid ? Rational(stream.pointee.avg_frame_rate) : Rational(stream.pointee.r_frame_rate)
+        let rate = frameRate(stream)
         let tb = stream.timeBase
         let frameDuration = rate.isValid ? max(1, av_rescale_q(1, AVRational(num: rate.den, den: rate.num), tb.av)) : 1
 
@@ -158,6 +161,54 @@ enum MediaProbe {
             profile: par.pointee.profile,
             level: par.pointee.level
         )
+    }
+
+    /// A track the player decodes and draws itself. The HLS rendition is `PlaceholderVideo`,
+    /// tagged with the source's dynamic range, and keeps the source's size, rate and clock.
+    private static func renderedVideoTrack(_ stream: UnsafeMutablePointer<AVStream>, index: Int32) -> VideoTrack {
+        let par = stream.codecpar
+        let range: VideoRange
+        switch transferCharacteristics(par) {
+        case AVCOL_TRC_SMPTE2084: range = .pq
+        case AVCOL_TRC_ARIB_STD_B67: range = .hlg
+        default: range = .sdr
+        }
+        let placeholder = PlaceholderVideo.stream(for: range)
+        let rate = frameRate(stream)
+        let tb = stream.timeBase
+        let streamAspect = Rational(stream.pointee.sample_aspect_ratio)
+        let codecAspect = Rational(par.pointee.sample_aspect_ratio)
+        let source = RenderedVideoSource(
+            codecID: par.pointee.codec_id.rawValue,
+            codecName: codecName(par.pointee.codec_id),
+            pixelFormat: par.pointee.format,
+            sampleAspect: streamAspect.isValid ? streamAspect : codecAspect.isValid ? codecAspect : Rational(num: 1, den: 1),
+            colorPrimaries: Int32(par.pointee.color_primaries.rawValue),
+            colorTransfer: Int32(transferCharacteristics(par).rawValue),
+            colorSpace: Int32(par.pointee.color_space.rawValue),
+            colorRange: Int32(par.pointee.color_range.rawValue)
+        )
+        return VideoTrack(
+            streamIndex: index,
+            codec: placeholder.codec,
+            timeBase: tb,
+            width: Int(par.pointee.width),
+            height: Int(par.pointee.height),
+            frameRate: rate.isValid ? rate.doubleValue : nil,
+            frameDuration: rate.isValid ? max(1, av_rescale_q(1, AVRational(num: rate.den, den: rate.num), tb.av)) : 1,
+            reorderDepth: 0,
+            bitRate: bitRate(stream),
+            range: range,
+            dolbyVision: nil,
+            extradata: placeholder.record,
+            profile: placeholder.profile,
+            level: placeholder.level,
+            rendered: source
+        )
+    }
+
+    private static func frameRate(_ stream: UnsafeMutablePointer<AVStream>) -> Rational {
+        Rational(stream.pointee.avg_frame_rate).isValid ? Rational(stream.pointee.avg_frame_rate) : Rational(stream.pointee.r_frame_rate)
     }
 
     private static func audioTracks(_ demuxer: Demuxer) -> [AudioTrack] {

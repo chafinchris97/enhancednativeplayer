@@ -1,3 +1,4 @@
+import AetherLibavutil
 import Foundation
 import Hummingbird
 import Logging
@@ -31,6 +32,7 @@ final class EnhancedPlaybackSession: Sendable {
 
     private let core: PlaybackSessionCore
     private let server: HLSServer
+    private let renderedKeyframeTicks = Mutex<[Int64]?>(nil)
 
     private init(masterPlaylistURL: URL, core: PlaybackSessionCore, server: HLSServer) {
         self.masterPlaylistURL = masterPlaylistURL
@@ -264,6 +266,48 @@ final class EnhancedPlaybackSession: Sendable {
         CGSize(width: core.context.media.video.width, height: core.context.media.video.height)
     }
 
+    /// Whether the player decodes and draws the video itself, above a placeholder rendition.
+    var rendersVideo: Bool { core.context.media.video.rendered != nil }
+
+    /// The rendered video's shape on screen: its size with the pixel aspect applied. Nil when
+    /// AVPlayer draws the video, whose `presentationSize` says the same.
+    var renderedDisplaySize: CGSize? {
+        guard let source = core.context.media.video.rendered else { return nil }
+        return CGSize(width: videoSize.width * source.sampleAspect.doubleValue, height: videoSize.height)
+    }
+
+    /// Where a seek the user made in the system controls lands, playlist ticks: on a nearby
+    /// keyframe for AV1 the player decodes itself (see `KeyframeSnap`), nil to keep it exact.
+    func keyframeLanding(target: Int64, current: Int64) -> Int64? {
+        guard let source = core.context.media.video.rendered, source.codecName == "av1" else { return nil }
+        let keyframes = renderedKeyframeTicks.withLock { cached in
+            if cached == nil { cached = core.context.keyframeTicks }
+            return cached!
+        }
+        return KeyframeSnap.landing(target: target, current: current, keyframes: keyframes)
+    }
+
+    /// Bytes of one decoded frame of the rendered video, as the display layer gets it.
+    var videoFrameBytes: Int {
+        let video = core.context.media.video
+        let pixelFormat = video.range == .sdr ? video.rendered?.pixelFormat ?? -1 : AV_PIX_FMT_YUV420P10LE.rawValue
+        return PixelBufferConverter.bytesPerFrame(width: video.width, height: video.height, pixelFormat: pixelFormat)
+    }
+
+    /// A decoder for the rendered video, reading the file through the session's block cache.
+    /// It stops reading when the session stops or `token` is cancelled.
+    func makeVideoDecoder(token: CancellationToken) throws -> RenderedVideoDecoder {
+        let context = core.context
+        return try RenderedVideoDecoder(file: context.file, media: context.media, originTicks: context.originTicks, token: token)
+    }
+
+    /// Holds the first video segment of a seek until the player has decoded its frame; nil
+    /// unless the player draws the video.
+    var videoStartGate: VideoStartGate? { core.videoGate }
+
+    /// The session's own cancellation, for a token that should also end with the session.
+    var cancellationToken: CancellationToken { core.context.token }
+
     /// The length of one video frame in 100 ns ticks, nil unless the video has a standard
     /// constant rate. The demuxer's average rate is often a little off (23.98 for 24000/1001),
     /// and frame starts are counted from 0, so only the exact rate keeps a 2 h film on its frames.
@@ -316,6 +360,9 @@ final class PlaybackSessionCore: Sendable {
     let externalFonts: [ASSFont]
     /// Which tracks the master marks DEFAULT.
     let startSelection = Mutex(StartSelection())
+    /// Holds a run's first video segment until the player has decoded its frame; nil unless the
+    /// player draws the video.
+    let videoGate: VideoStartGate?
     private let logger: Logger
 
     init(context: RemuxContext, directory: URL, segmentsAhead: Int, externalFonts: [ASSFont] = [], trickplay: TrickplayRendition? = nil, logger: Logger) {
@@ -323,6 +370,7 @@ final class PlaybackSessionCore: Sendable {
         self.directory = directory
         self.externalFonts = externalFonts
         self.logger = logger
+        self.videoGate = context.media.video.rendered == nil ? nil : VideoStartGate()
         var playlists = PlaylistBuilder(media: context.media, plan: context.plan, subtitleGrid: context.subtitleGrid)
         playlists.trickplay = trickplay
         self.playlists = playlists
@@ -336,7 +384,9 @@ final class PlaybackSessionCore: Sendable {
             token: context.token,
             logger: logger,
             fileName: { segment, _ in "video_\(segment).mp4" },
-            producer: { _ in VideoProducer(context: context) }
+            producer: { _ -> SegmentProducer in
+                context.media.video.rendered == nil ? VideoProducer(context: context) : PlaceholderVideoProducer(context: context)
+            }
         )
         sdrVideo = SegmentPipeline(
             name: "video_sdr",
@@ -388,6 +438,16 @@ final class PlaybackSessionCore: Sendable {
                 return .mp4(try await inits.data(for: "audio-\(track)") { try InitSegmentBuilder.audio(context, track: audio, token: token) }, audio: true)
             case .videoSegment(let index):
                 checkTicks(runtimeTicks, index: index, file: fileName)
+                if let gate = videoGate, context.plan.segments.indices.contains(index) {
+                    let segments = context.plan.segments
+                    let start = segments[index].runtimeTicks
+                    let end = index + 1 < segments.count ? segments[index + 1].runtimeTicks : start + Int64(segments[index].duration * 10_000_000)
+                    let startsRun = gate.startsRun(index)
+                    let logger = logger
+                    return try await serve(index, track: 0, from: video, audio: false) {
+                        await gate.hold(segment: index, range: start..<end, startsRun: startsRun, logger: logger)
+                    }
+                }
                 return try await serve(index, track: 0, from: video, audio: false)
             case .audioSegment(let track, let index):
                 guard context.media.audio.indices.contains(track) else { return Response(status: .notFound) }
@@ -450,8 +510,11 @@ final class PlaybackSessionCore: Sendable {
         }
     }
 
-    private func serve(_ index: Int, track: Int, from pipeline: SegmentPipeline, audio: Bool) async throws -> Response {
-        let url = try await pipeline.segment(index, track: track)
+    /// The segment's file, sent once `hold` (if any) has returned; the two run side by side.
+    private func serve(_ index: Int, track: Int, from pipeline: SegmentPipeline, audio: Bool, hold: (@Sendable () async -> Void)? = nil) async throws -> Response {
+        async let file = pipeline.segment(index, track: track)
+        if let hold { await hold() }
+        let url = try await file
         return try Response.segment(url, audio: audio) { delivered in
             pipeline.didFinishSending(url, segment: index, delivered: delivered)
         }

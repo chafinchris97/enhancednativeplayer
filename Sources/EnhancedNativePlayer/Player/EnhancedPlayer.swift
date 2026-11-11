@@ -87,6 +87,7 @@ public final class EnhancedPlayer {
     @ObservationIgnored private var waitingObservation: NSKeyValueObservation?
     @ObservationIgnored private var pgsRenderer: PGSSubtitleRenderer?
     @ObservationIgnored private var assRenderer: ASSSubtitleRenderer?
+    @ObservationIgnored private var videoRenderer: RenderedVideoRenderer?
     @ObservationIgnored private var forcedSubtitles: ForcedSubtitleSelector?
     @ObservationIgnored private var audioSessionActive = false
     #if os(tvOS)
@@ -159,6 +160,19 @@ public final class EnhancedPlayer {
     /// Showing the view again starts a new session from the same position.
     public func stop() {
         teardown()
+    }
+
+    /// Where a seek the user made in the system controls goes. For AV1 the player decodes itself,
+    /// a nearby keyframe (see `KeyframeSnap`), so the picture shows at once instead of after
+    /// seconds of decoding; a jump to a chapter's start stays exact. Otherwise where it was aimed.
+    func seekTarget(afterUserNavigatedFrom old: CMTime, to target: CMTime) -> CMTime {
+        guard let session, target.isNumeric, old.isNumeric else { return target }
+        let chapters = customChapters ?? fileChapters
+        if chapters.contains(where: { abs(max(0, $0.start - session.originSeconds) - target.seconds) < 0.05 }) { return target }
+        func ticks(_ time: CMTime) -> Int64 { CMTimeConvertScale(time, timescale: 10_000_000, method: .roundHalfAwayFromZero).value }
+        guard let landing = session.keyframeLanding(target: ticks(target), current: ticks(old)) else { return target }
+        Logger.player.info("Seek to \(String(format: "%.3f", target.seconds)) s lands on the keyframe at \(String(format: "%.3f", Double(landing) / 1e7)) s")
+        return CMTime(value: landing, timescale: 10_000_000)
     }
 
     // MARK: Tracks
@@ -397,6 +411,8 @@ public final class EnhancedPlayer {
         pgsRenderer = nil
         assRenderer?.stop()
         assRenderer = nil
+        videoRenderer?.stop()
+        videoRenderer = nil
         forcedSubtitles?.stop()
         forcedSubtitles = nil
         avPlayer.pause()
@@ -558,8 +574,16 @@ public final class EnhancedPlayer {
             pgsRenderer = nil
             assRenderer?.stop()
             assRenderer = nil
+            videoRenderer?.stop()
+            videoRenderer = nil
         }
-        guard let overlay = host?.playerViewController.contentOverlayView else { return }
+        guard let host, let overlay = host.playerViewController.contentOverlayView else { return }
+        if session.rendersVideo {
+            // Below the subtitles: it puts itself at the bottom of the overlay.
+            let renderer = videoRenderer ?? RenderedVideoRenderer(session: session, playerView: host.playerViewController.view, container: overlay)
+            videoRenderer = renderer
+            renderer.attach(item: item)
+        }
         if session.hasPGSTracks {
             let renderer = pgsRenderer ?? PGSSubtitleRenderer(session: session, container: overlay)
             pgsRenderer = renderer

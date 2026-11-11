@@ -462,7 +462,8 @@ final class ASSSubtitleRenderer {
         let bounds = overlay.bounds
         guard bounds.width > 0, bounds.height > 0, scale > 0 else { return }
         let size = session.videoSize
-        let presentation = item?.presentationSize ?? .zero
+        // AVPlayer's own picture is only a placeholder when the player draws the video.
+        let presentation = session.renderedDisplaySize ?? item?.presentationSize ?? .zero
         let aspect = presentation.width > 0 && presentation.height > 0 ? presentation : size
         let video = AVMakeRect(aspectRatio: aspect, insideRect: bounds)
         let layout = LibassRenderer.Layout(

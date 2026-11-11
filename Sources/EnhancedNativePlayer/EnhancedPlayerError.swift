@@ -22,7 +22,7 @@ public enum EnhancedPlayerError: Error, LocalizedError, Sendable {
         case .network(let message): "Network error: \(message)"
         case .ffmpeg(let operation, let code, let message): "\(operation) failed (\(code)): \(message)"
         case .noVideoStream: "The file has no video stream"
-        case .unsupportedVideoCodec(let name): "Video codec \(name) cannot be remuxed for AVPlayer (H.264 and HEVC only)"
+        case .unsupportedVideoCodec(let name): "Video codec \(name) can't be played: AVPlayer doesn't decode it, and it isn't one the player decodes to 4:2:0 at 8 or 10 bits"
         case .noKeyframeIndex: "The file carries no keyframe index (Matroska Cues / MP4 stss), so segments cannot be planned without reading the whole file"
         case .segmentOutOfRange(let index): "Segment \(index) is outside the playlist"
         case .unknownAudioTrack(let index): "Audio track \(index) does not exist"

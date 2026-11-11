@@ -37,6 +37,7 @@ let package = Package(
                 .product(name: "NIOTransportServices", package: "swift-nio-transport-services"),
                 .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"),
                 "Libass",
+                "PixelInterleave",
             ],
             // libass finds system fonts through CoreText; HarfBuzz is C++.
             linkerSettings: [.linkedFramework("CoreText"), .linkedLibrary("c++"), .linkedLibrary("iconv")]
@@ -44,6 +45,8 @@ let package = Package(
         // libass with its assembly, and the FreeType, FriBidi and HarfBuzz it needs, in one
         // static library per platform. Built by scripts/build-libass.sh.
         .binaryTarget(name: "Libass", path: "Frameworks/Libass.xcframework"),
+        // Plane interleaving for decoded video frames, in C with NEON so it is fast in a debug build too.
+        .target(name: "PixelInterleave"),
         .testTarget(
             name: "EnhancedNativePlayerTests",
             dependencies: ["EnhancedNativePlayer"]

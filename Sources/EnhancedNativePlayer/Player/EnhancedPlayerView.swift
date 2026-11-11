@@ -115,6 +115,7 @@ final class PlayerHostViewController: UIViewController {
         #if os(tvOS)
         // The player sets the display criteria itself, and waits for the switch before playing.
         playerViewController.appliesPreferredDisplayCriteriaAutomatically = false
+        playerViewController.delegate = self
         #endif
     }
 
@@ -145,4 +146,13 @@ final class PlayerHostViewController: UIViewController {
         player.detach(self)
     }
 }
+
+#if os(tvOS)
+extension PlayerHostViewController: @preconcurrency AVPlayerViewControllerDelegate {
+    /// A scrub or skip in the system controls: the player may move it to a nearby keyframe.
+    func playerViewController(_ playerViewController: AVPlayerViewController, timeToSeekAfterUserNavigatedFrom oldTime: CMTime, to targetTime: CMTime) -> CMTime {
+        player.seekTarget(afterUserNavigatedFrom: oldTime, to: targetTime)
+    }
+}
+#endif
 #endif

@@ -38,7 +38,8 @@ final class RemuxContext: Sendable {
         self.plan = plan
         self.subtitleGrid = SubtitleGrid(totalTicks: plan.timeBase.rescaleNearest(plan.segments.last!.end - plan.origin, to: .ticks))
         self.token = token
-        self.sdrRewriter = media.video.isHDR ? SDRBitstreamRewriter(codec: media.video.codec, extradata: media.video.extradata) : nil
+        // Rendered video has no bitstream in the playlist to relabel.
+        self.sdrRewriter = media.video.isHDR && media.video.rendered == nil ? SDRBitstreamRewriter(codec: media.video.codec, extradata: media.video.extradata) : nil
         self.timeline = Timeline(videoTimeBase: media.keyframes.timeBase, originPresentation: plan.origin + presentationShift(media))
     }
 
@@ -46,6 +47,14 @@ final class RemuxContext: Sendable {
     /// the file minus this is the same moment in the playlist, which is what AVPlayer reports.
     var originTicks: Int64 {
         timeline.videoTimeBase.rescaleNearest(timeline.originPresentation, to: .ticks)
+    }
+
+    /// Every keyframe's presentation time on the playlist timeline, 100 ns ticks: the same value
+    /// a decoded keyframe's start gets.
+    var keyframeTicks: [Int64] {
+        let shift = presentationShift(media)
+        let tb = media.keyframes.timeBase
+        return media.keyframes.timestamps.map { tb.rescaleNearest($0 + shift, to: .ticks) - originTicks }
     }
 
     /// Presentation time (video time base) at which segment `index` starts.

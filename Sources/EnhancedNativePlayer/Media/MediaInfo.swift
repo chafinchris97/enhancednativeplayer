@@ -20,8 +20,26 @@ enum VideoCodec: Sendable {
     case hevc
 }
 
+/// The file's own video when AVPlayer can't decode it (AV1, VC-1, MPEG-4 Part 2, …). The player
+/// decodes it and draws the frames itself; the HLS video rendition is a black placeholder that
+/// gives AVPlayer a timeline, and `VideoTrack` then describes that placeholder's stream.
+struct RenderedVideoSource: Sendable, Equatable {
+    var codecID: UInt32
+    var codecName: String
+    /// The decoder's output `AVPixelFormat`, `AV_PIX_FMT_NONE` (-1) when the probe didn't learn it.
+    var pixelFormat: Int32
+    /// Width over height of one pixel, 1:1 when the file doesn't say.
+    var sampleAspect: Rational
+    /// `AVColorPrimaries`, `AVColorTransferCharacteristic`, `AVColorSpace` and `AVColorRange`.
+    var colorPrimaries: Int32
+    var colorTransfer: Int32
+    var colorSpace: Int32
+    var colorRange: Int32
+}
+
 struct VideoTrack: Sendable {
     var streamIndex: Int32
+    /// For rendered video, the placeholder's codec.
     var codec: VideoCodec
     var timeBase: Rational
     var width: Int
@@ -37,6 +55,8 @@ struct VideoTrack: Sendable {
     var extradata: [UInt8]
     var profile: Int32
     var level: Int32
+    /// Set when the player draws the video itself; see `RenderedVideoSource`.
+    var rendered: RenderedVideoSource? = nil
 
     /// `dvh1` for Dolby Vision profiles 5 and 8, which AVPlayer decodes natively.
     /// Profile 7 is dual-layer and unsupported, so it rides `hvc1` as plain HDR10.
