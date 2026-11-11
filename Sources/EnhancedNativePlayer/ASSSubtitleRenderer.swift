@@ -325,6 +325,7 @@ final class ASSSubtitleRenderer {
     private var selection = 0
     private var engine: ASSRenderEngine?
     private var setupTask: Task<Void, Never>?
+    private var timebaseTask: Task<Void, Never>?
     private var loads: [Int: Task<Void, Never>] = [:]
     private var segments: [Int: ASSSegment] = [:]
     /// The enqueued samples run from `start` to `end` (playlist ticks), rendered under `generation`.
@@ -365,7 +366,25 @@ final class ASSSubtitleRenderer {
         presentationSizeObservation = item.observe(\.presentationSize, options: [.new]) { [weak self] _, _ in
             Task { @MainActor [weak self] in self?.updateLayout() }
         }
+        attachLayer(to: item)
         updateSelection(of: item)
+    }
+
+    /// Puts the sample layer on `item`'s timebase as soon as it has one, before playback starts.
+    /// A layer given a timebase that is already running shows every sample a frame late until
+    /// a seek, and setting up libass (fonts first) usually takes longer than the start of playback.
+    private func attachLayer(to item: AVPlayerItem) {
+        timebaseTask = Task { [weak self] in
+            // The item has a timebase once it is the player's current item, not always at once.
+            var timebase = item.timebase
+            for _ in 0..<200 where timebase == nil {
+                try? await Task.sleep(for: .milliseconds(25))
+                guard !Task.isCancelled else { return }
+                timebase = item.timebase
+            }
+            guard let self, !Task.isCancelled, self.item === item, let timebase else { return }
+            if self.overlay.timebase !== timebase { self.overlay.attach(timebase: timebase) }
+        }
     }
 
     func stop() {
@@ -376,6 +395,8 @@ final class ASSSubtitleRenderer {
     private func detach() {
         if let selectionObserver { NotificationCenter.default.removeObserver(selectionObserver) }
         if let jumpObserver { NotificationCenter.default.removeObserver(jumpObserver) }
+        timebaseTask?.cancel()
+        timebaseTask = nil
         selectionObserver = nil
         jumpObserver = nil
         presentationSizeObservation = nil
