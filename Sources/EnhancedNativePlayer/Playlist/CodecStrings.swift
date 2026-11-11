@@ -2,8 +2,10 @@ import Foundation
 
 /// RFC 6381 `CODECS` values for the master playlist.
 enum CodecStrings {
+    /// `CODECS`: Dolby Vision itself for profile 5, else the codec of the sample entry,
+    /// which for profile 8 is its HEVC base layer.
     static func video(_ track: VideoTrack) -> String {
-        if track.emitsDolbyVision, let dv = track.dolbyVision {
+        if track.emitsDolbyVision, let dv = track.dolbyVision, dv.profile == 5 {
             return dolbyVision(dv)
         }
         switch track.codec {
@@ -12,9 +14,24 @@ enum CodecStrings {
         }
     }
 
-    /// Plain HEVC description of a Dolby Vision track's base layer, for the fallback variant.
-    static func baseLayer(_ track: VideoTrack) -> String {
-        hevc(track, entry: "hvc1")
+    /// `SUPPLEMENTAL-CODECS`. Dolby Vision profile 8: the profile and level, then the brand
+    /// of the base layer it is compatible with. HDR10+: the HEVC string again with the
+    /// `cdm4` brand. Dolby Vision wins when a file has both. Nil for everything else.
+    static func supplemental(_ track: VideoTrack) -> String? {
+        guard track.emitsDolbyVision, let dv = track.dolbyVision, dv.profile == 8 else {
+            if track.hdr10Plus, !track.emitsDolbyVision, track.codec == .hevc {
+                return hevc(track, entry: "hvc1") + "/cdm4"
+            }
+            return nil
+        }
+        let brand: String
+        switch dv.compatibilityID {
+        case 1: brand = "db1p"
+        case 2: brand = "db2g"
+        case 4: brand = "db4h"
+        default: return dolbyVision(dv)
+        }
+        return dolbyVision(dv) + "/" + brand
     }
 
     static func dolbyVision(_ dv: DolbyVisionConfiguration) -> String {

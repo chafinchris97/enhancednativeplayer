@@ -120,6 +120,11 @@ public final class EnhancedPlayer {
         self.configuration = configuration
         self.externalSubtitles = subtitles
         self.trickplay = trickplay
+        // Off for good: AVPlayer starts on the master's DEFAULT renditions and the player makes
+        // every other selection itself. Under the automatic criteria the system subtitle setting
+        // would decide what is drawn (with subtitles off, only FORCED renditions, which these
+        // are not) and AVPlayer would reselect the subtitles on every audio switch.
+        avPlayer.appliesMediaSelectionCriteriaAutomatically = false
     }
 
     deinit {
@@ -204,7 +209,6 @@ public final class EnhancedPlayer {
             return
         }
         let name = session.subtitleTrackNames[index]
-        avPlayer.appliesMediaSelectionCriteriaAutomatically = false
         Task { await self.select(named: name, characteristic: .legible, in: item) }
     }
 
@@ -215,7 +219,6 @@ public final class EnhancedPlayer {
             selectedSubtitleTrackIndex = nil
             return
         }
-        avPlayer.appliesMediaSelectionCriteriaAutomatically = false
         Task { await self.select(named: nil, characteristic: .legible, in: item) }
     }
 
@@ -227,7 +230,11 @@ public final class EnhancedPlayer {
             Logger.player.warning("No rendition named \(name!)")
             return
         }
-        item.select(option, in: group)
+        if characteristic == .legible {
+            item.selectSubtitle(option, in: group)
+        } else {
+            item.select(option, in: group)
+        }
     }
 
     // MARK: Presentation
@@ -542,10 +549,8 @@ public final class EnhancedPlayer {
         }
         switch startSelection.subtitle {
         case .track(let index):
-            avPlayer.appliesMediaSelectionCriteriaAutomatically = false
             await select(named: session.subtitleTrackNames[index], characteristic: .legible, in: item)
         case .off:
-            avPlayer.appliesMediaSelectionCriteriaAutomatically = false
             await select(named: nil, characteristic: .legible, in: item)
         case nil:
             break
@@ -601,7 +606,11 @@ public final class EnhancedPlayer {
         waitingObservation = avPlayer.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
             let reason = player.reasonForWaitingToPlay?.rawValue ?? "none"
             Logger.player.info("AVPlayer timeControlStatus \(player.timeControlStatus.rawValue), waiting reason \(reason)")
-            Task { @MainActor [weak self] in self?.updateStatus() }
+            let playing = player.timeControlStatus == .playing
+            Task { @MainActor [weak self] in
+                self?.updateStatus()
+                if playing { self?.logVideoFormat(item, when: "playing") }
+            }
         }
         itemObservations.append(item.observe(\.status, options: [.new]) { [weak self] item, _ in
             Task { @MainActor [weak self] in
@@ -609,6 +618,8 @@ public final class EnhancedPlayer {
                 Logger.player.info("AVPlayerItem status \(item.status.rawValue)\(item.error.map { ": \($0)" } ?? "")")
                 switch item.status {
                 case .readyToPlay:
+                    self.logVideoFormat(item, when: "ready")
+                    self.forcedSubtitles?.itemIsReady(item)
                     // The start position held for the SDR fallback; from here on, time moves.
                     if self.isReady { self.startPosition = nil }
                 case .failed:
@@ -625,7 +636,14 @@ public final class EnhancedPlayer {
                 }
             }
         })
+        itemObservations.append(item.observe(\.tracks, options: [.new]) { [weak self] item, _ in
+            Task { @MainActor [weak self] in self?.logVideoFormat(item, when: "tracks changed") }
+        })
         let center = NotificationCenter.default
+        // Seeks, the player's own and scrubs in the transport bar alike.
+        itemObservers.append(center.addObserver(forName: AVPlayerItem.timeJumpedNotification, object: item, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.logVideoFormat(item, when: "time jumped") }
+        })
         itemObservers.append(center.addObserver(forName: AVPlayerItem.newErrorLogEntryNotification, object: item, queue: .main) { _ in
             guard let event = item.errorLog()?.events.last else { return }
             Logger.player.warning("AVPlayer error log: \(event.errorDomain) \(event.errorStatusCode) \(event.errorComment ?? "") \(event.uri ?? "")")
@@ -641,6 +659,38 @@ public final class EnhancedPlayer {
                 guard let self, self.isReady, time.isNumeric else { return }
                 self.currentTime = time.seconds + session.originSeconds
             }
+        }
+    }
+
+    /// What AVPlayer has as the video's sample description: the sample entry, the transfer
+    /// function and the extension boxes (dvcC / dvvC carry the Dolby Vision profile). The
+    /// master's variants are logged with it, as AVPlayer parsed them.
+    private func logVideoFormat(_ item: AVPlayerItem, when moment: String) {
+        guard self.item === item else { return }
+        let itemTracks = item.tracks
+        let asset = item.asset as? AVURLAsset
+        Task {
+            // Every item track, so a video track without an asset track still shows.
+            var lines = ["\(itemTracks.count) item tracks: " + itemTracks.map { $0.assetTrack.map { "\($0.mediaType.rawValue) \($0.trackID)" } ?? "no asset track" }.joined(separator: ", ")]
+            for track in itemTracks.compactMap(\.assetTrack) where track.mediaType == .video {
+                let descriptions = (try? await track.load(.formatDescriptions)) ?? []
+                if descriptions.isEmpty { lines.append("track \(track.trackID): no format description yet") }
+                for description in descriptions {
+                    let subtype = CMFormatDescriptionGetMediaSubType(description).fourCharacterCode
+                    let transfer = CMFormatDescriptionGetExtension(description, extensionKey: kCMFormatDescriptionExtension_TransferFunction) as? String ?? "none"
+                    let atoms = CMFormatDescriptionGetExtension(description, extensionKey: kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms) as? [String: Any]
+                    let boxes = atoms.map { $0.keys.sorted().joined(separator: ",") } ?? "none"
+                    lines.append("track \(track.trackID): \(subtype), transfer \(transfer), boxes \(boxes)")
+                }
+            }
+            if moment == "ready", let asset, let variants = try? await asset.load(.variants) {
+                for variant in variants {
+                    let video = variant.videoAttributes
+                    let codecs = video?.codecTypes.map(\.fourCharacterCode).joined(separator: ",") ?? "none"
+                    lines.append("variant: codecs \(codecs), range \(video?.videoRange.rawValue ?? "none")")
+                }
+            }
+            Logger.player.info("Video format (\(moment)): \(lines.joined(separator: "; "))")
         }
     }
 
@@ -719,3 +769,11 @@ enum MetadataItems {
     }
 }
 #endif
+
+private extension UInt32 {
+    /// `dvh1`, `hvc1`, …
+    var fourCharacterCode: String {
+        let bytes = [24, 16, 8, 0].map { UInt8(truncatingIfNeeded: self >> $0) }
+        return String(decoding: bytes, as: UTF8.self)
+    }
+}

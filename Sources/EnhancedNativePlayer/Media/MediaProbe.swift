@@ -49,6 +49,11 @@ enum MediaProbe {
         if video.codec == .hevc, video.rendered == nil, let record = firstSample.withUnsafeBufferPointer({ HEVCConfigurationRecord.filling(video.extradata, from: $0) }) {
             video.extradata = record
         }
+        // Only in-band SEI reaches AVPlayer, so HDR10+ carried as Matroska BlockAdditional
+        // side data is not announced.
+        if video.codec == .hevc, video.rendered == nil, video.range == .pq {
+            video.hdr10Plus = HDR10Plus.isPresent(in: firstSample, hvcC: video.extradata)
+        }
         let tb = video.timeBase
         var end: Int64
         if videoStream.pointee.duration != FF.noPTS, videoStream.pointee.duration > 0 {

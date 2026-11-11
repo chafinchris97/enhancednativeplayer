@@ -22,6 +22,27 @@ enum InitSegmentBuilder {
         return try muxFirstPacket(of: video.streamIndex, demuxer: demuxer, writer: writer)
     }
 
+    /// The sample entry and Dolby Vision record of a video init, for the log: the
+    /// first of `hvc1` / `dvh1` / `avc1`, then the dvcC / dvvC fields if there is one.
+    static func describeVideo(_ data: Data) -> String {
+        let bytes = [UInt8](data)
+        func find(_ type: String) -> Int? {
+            let pattern = Array(type.utf8)
+            guard bytes.count >= pattern.count else { return nil }
+            return (0...(bytes.count - pattern.count)).first { bytes[$0..<$0 + pattern.count].elementsEqual(pattern) }
+        }
+        let entry = ["hvc1", "hev1", "dvh1", "dvhe", "avc1"].first { find($0) != nil } ?? "no sample entry"
+        guard let at = find("dvvC") ?? find("dvcC") else { return "\(entry), no dvcC/dvvC" }
+        let box = String(decoding: bytes[at..<at + 4], as: UTF8.self)
+        let p = at + 4
+        guard p + 5 <= bytes.count else { return "\(entry), \(box) truncated" }
+        let profile = Int(bytes[p + 2] >> 1)
+        let level = Int((bytes[p + 2] & 1) << 5 | bytes[p + 3] >> 3)
+        let rpu = (bytes[p + 3] >> 2) & 1, el = (bytes[p + 3] >> 1) & 1, bl = bytes[p + 3] & 1
+        let compatibility = Int(bytes[p + 4] >> 4)
+        return "\(entry), \(box) version \(bytes[p]).\(bytes[p + 1]) profile \(profile) level \(level) rpu \(rpu) el \(el) bl \(bl) compatibility \(compatibility)"
+    }
+
     static func audio(_ context: RemuxContext, track: AudioTrack, token: CancellationToken) throws -> Data {
         let demuxer = try Demuxer(file: context.file, token: token)
         demuxer.discardAll(except: [track.streamIndex])

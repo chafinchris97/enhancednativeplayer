@@ -20,6 +20,21 @@ struct PlaylistBuilder: Sendable {
         return media.audio.first(where: \.isDefault)?.index ?? media.audio.first?.index
     }
 
+    /// The regular (non-forced) subtitle track in the first of `preferredLanguages` (BCP 47, as
+    /// in `Locale.preferredLanguages`) the file has one in. Nil when the audio track at `audio`
+    /// is already in the language reached first, or when no track matches.
+    func preferredSubtitleIndex(forAudio audio: Int?, preferredLanguages: [String]) -> Int? {
+        let audioLanguage = audio.flatMap { media.audio.indices.contains($0) ? media.audio[$0].language : nil }.flatMap(Languages.tag)
+        for preferred in preferredLanguages {
+            guard let tag = Languages.tag(Locale.Language(identifier: preferred).languageCode?.identifier ?? preferred) else { continue }
+            if tag == audioLanguage { return nil }
+            if let track = media.subtitles.first(where: { !$0.isForced && $0.language.flatMap(Languages.tag) == tag }) {
+                return track.index
+            }
+        }
+        return nil
+    }
+
     /// The subtitle track the master marks DEFAULT, nil for none.
     func defaultSubtitleIndex(_ start: StartSelection = StartSelection()) -> Int? {
         switch start.subtitle {
@@ -61,14 +76,20 @@ struct PlaylistBuilder: Sendable {
         let subtitleLanguages = subtitleLanguages()
         let defaultSubtitle = defaultSubtitleIndex(start)
         for track in media.subtitles {
-            let attributes = [
+            var attributes = [
                 "TYPE=SUBTITLES",
                 "GROUP-ID=\"\(Self.subtitleGroup)\"",
                 "NAME=\"\(subtitleNames[track.index])\"",
                 "LANGUAGE=\"\(subtitleLanguages[track.index])\"",
-                "DEFAULT=\(track.index == defaultSubtitle ? "YES" : "NO")",
-                "URI=\"subtitle_\(track.index).m3u8\"",
             ]
+            // AVPlayer turns a DEFAULT rendition on only if it may also autoselect it. The
+            // others stay out of automatic selection.
+            if track.index == defaultSubtitle {
+                attributes += ["AUTOSELECT=YES", "DEFAULT=YES"]
+            } else {
+                attributes.append("DEFAULT=NO")
+            }
+            attributes.append("URI=\"subtitle_\(track.index).m3u8\"")
             lines.append("#EXT-X-MEDIA:" + attributes.joined(separator: ","))
         }
         if !media.subtitles.isEmpty { lines.append("") }
@@ -77,29 +98,24 @@ struct PlaylistBuilder: Sendable {
         let audioCodecs = uniqued(media.audio.map(CodecStrings.audio))
         let (peak, average) = bandwidth()
 
-        func variant(codec: String, range: VideoRange) {
-            var attributes = [
-                "BANDWIDTH=\(peak)",
-                "AVERAGE-BANDWIDTH=\(average)",
-                "CODECS=\"\(([codec] + audioCodecs).joined(separator: ","))\"",
-                "RESOLUTION=\(video.width)x\(video.height)",
-            ]
-            if let rate = video.frameRate { attributes.append("FRAME-RATE=\(String(format: "%.3f", rate))") }
-            attributes.append("VIDEO-RANGE=\(range.rawValue)")
-            if !media.audio.isEmpty { attributes.append("AUDIO=\"\(Self.audioGroup)\"") }
-            if !media.subtitles.isEmpty { attributes.append("SUBTITLES=\"\(Self.subtitleGroup)\"") }
-            attributes.append("CLOSED-CAPTIONS=NONE")
-            lines.append("#EXT-X-STREAM-INF:" + attributes.joined(separator: ","))
-            lines.append(sdr ? "video_sdr.m3u8" : "video.m3u8")
+        // Dolby Vision profile 8 is one variant: CODECS is the HEVC base layer and
+        // SUPPLEMENTAL-CODECS the Dolby Vision on top, which a client without it ignores.
+        var attributes = [
+            "BANDWIDTH=\(peak)",
+            "AVERAGE-BANDWIDTH=\(average)",
+            "CODECS=\"\(([CodecStrings.video(video)] + audioCodecs).joined(separator: ","))\"",
+        ]
+        if let supplemental = CodecStrings.supplemental(video) {
+            attributes.append("SUPPLEMENTAL-CODECS=\"\(supplemental)\"")
         }
-
-        variant(codec: CodecStrings.video(video), range: video.range)
-        // Profile 8 carries an HDR10 / HLG / SDR base layer: offer it as a fallback
-        // variant for clients that pass on Dolby Vision. Profile 5 has no compatible
-        // base layer, and profile 7 is already announced as plain HEVC HDR.
-        if video.emitsDolbyVision, let dv = video.dolbyVision, dv.profile == 8 {
-            variant(codec: CodecStrings.baseLayer(video), range: video.range)
-        }
+        attributes.append("RESOLUTION=\(video.width)x\(video.height)")
+        if let rate = video.frameRate { attributes.append("FRAME-RATE=\(String(format: "%.3f", rate))") }
+        attributes.append("VIDEO-RANGE=\(video.range.rawValue)")
+        if !media.audio.isEmpty { attributes.append("AUDIO=\"\(Self.audioGroup)\"") }
+        if !media.subtitles.isEmpty { attributes.append("SUBTITLES=\"\(Self.subtitleGroup)\"") }
+        attributes.append("CLOSED-CAPTIONS=NONE")
+        lines.append("#EXT-X-STREAM-INF:" + attributes.joined(separator: ","))
+        lines.append(sdr ? "video_sdr.m3u8" : "video.m3u8")
         if let trickplay {
             let attributes = [
                 "BANDWIDTH=\(trickplay.bandwidth)",

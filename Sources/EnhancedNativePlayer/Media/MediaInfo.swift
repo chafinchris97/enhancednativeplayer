@@ -57,9 +57,10 @@ struct VideoTrack: Sendable {
     var level: Int32
     /// Set when the player draws the video itself; see `RenderedVideoSource`.
     var rendered: RenderedVideoSource? = nil
+    /// HEVC PQ video carrying HDR10+ SEI, which the master announces with the `cdm4` brand.
+    var hdr10Plus = false
 
-    /// `dvh1` for Dolby Vision profiles 5 and 8, which AVPlayer decodes natively.
-    /// Profile 7 is dual-layer and unsupported, so it rides `hvc1` as plain HDR10.
+    /// Dolby Vision profiles 5 and 8, which AVPlayer decodes natively. Profile 7 is dual-layer and unsupported, so it rides `hvc1` as plain HDR10.
     var emitsDolbyVision: Bool {
         guard codec == .hevc, let dolbyVision else { return false }
         return dolbyVision.profile == 5 || dolbyVision.profile == 8
@@ -75,13 +76,16 @@ struct VideoTrack: Sendable {
         var track = self
         track.range = .sdr
         track.dolbyVision = nil
+        track.hdr10Plus = false
         return track
     }
 
+    /// `dvh1` only for profile 5, which has no compatible base layer. Profile 8 is `hvc1`
+    /// with its dvcC / dvvC, the backward-compatible signaling Apple's HLS spec asks for.
     var sampleEntry: String {
         switch codec {
         case .h264: "avc1"
-        case .hevc: emitsDolbyVision ? "dvh1" : "hvc1"
+        case .hevc: emitsDolbyVision && dolbyVision?.profile == 5 ? "dvh1" : "hvc1"
         }
     }
 }

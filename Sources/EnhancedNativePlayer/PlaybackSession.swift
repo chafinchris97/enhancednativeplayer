@@ -208,6 +208,16 @@ final class EnhancedPlaybackSession: Sendable {
         return subtitleTrackNames[track.index]
     }
 
+    /// The regular subtitle rendition in the system's preferred language, by name, for when
+    /// the audio rendition `name` has no forced track. Nil if the audio is already in that
+    /// language or the file has no track in it.
+    func preferredSubtitleName(forAudioNamed name: String) -> String? {
+        guard let audio = audioTrackNames.firstIndex(of: name),
+              let track = core.playlists.preferredSubtitleIndex(forAudio: audio, preferredLanguages: Locale.preferredLanguages)
+        else { return nil }
+        return subtitleTrackNames[track]
+    }
+
     func isForcedSubtitle(named name: String) -> Bool {
         guard let track = subtitleTrackNames.firstIndex(of: name) else { return false }
         return core.context.media.subtitles[track].isForced
@@ -430,7 +440,12 @@ final class PlaybackSessionCore: Sendable {
                 return .playlist(playlists.audioPlaylist(track: track))
             case .videoInit:
                 let token = context.token
-                return .mp4(try await inits.data(for: "video") { try InitSegmentBuilder.video(context, token: token) }, audio: false)
+                let logger = logger
+                return .mp4(try await inits.data(for: "video") {
+                    let data = try InitSegmentBuilder.video(context, token: token)
+                    logger.info("init_video.mp4: \(InitSegmentBuilder.describeVideo(data))")
+                    return data
+                }, audio: false)
             case .audioInit(let track):
                 guard context.media.audio.indices.contains(track) else { return Response(status: .notFound) }
                 let token = context.token

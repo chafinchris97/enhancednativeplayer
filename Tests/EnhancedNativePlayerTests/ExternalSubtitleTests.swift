@@ -296,3 +296,54 @@ struct ExternalSubtitleSessionTests {
         #expect(assEvents.events.count == 1)
     }
 }
+
+/// The regular track that replaces a forced one when the new audio has no forced track.
+struct PreferredSubtitleTests {
+    private func playlists(audio: [String], subtitles: [(language: String, forced: Bool)]) -> PlaylistBuilder {
+        let ms = Rational(num: 1, den: 1000)
+        let video = VideoTrack(
+            streamIndex: 0, codec: .h264, timeBase: ms, width: 1920, height: 1080, frameRate: 24,
+            frameDuration: 42, reorderDepth: 0, bitRate: nil, range: .sdr, dolbyVision: nil,
+            extradata: [], profile: 100, level: 40
+        )
+        let audioTracks = audio.enumerated().map { index, language in
+            AudioTrack(
+                index: index, streamIndex: Int32(index + 1), codecID: 0, codecName: "aac", profile: 0, profileName: nil,
+                timeBase: ms, startTime: 0, sampleRate: 48000, channels: 2, bitsPerRawSample: 0, language: language,
+                title: nil, bitRate: nil, isDefault: index == 0, isAtmos: false, delivery: .copy, extradata: []
+            )
+        }
+        let subtitleTracks = subtitles.enumerated().map { index, track in
+            SubtitleTrack(
+                index: index, streamIndex: Int32(index + 10), codecName: "ass", timeBase: .ticks,
+                language: track.language, title: nil, isDefault: false, isForced: track.forced, textFormat: nil,
+                external: nil
+            )
+        }
+        let media = MediaInfo(
+            formatName: "matroska", fileSize: 1_000_000, durationSeconds: 12, bitRate: nil, video: video,
+            audio: audioTracks, subtitles: subtitleTracks,
+            keyframes: KeyframeIndex(timestamps: [0, 6000], positions: [0, 1], timeBase: ms, usesDecodeTimestamps: false, presentationOffset: 0),
+            videoEndTimestamp: 12000
+        )
+        let plan = SegmentPlan(keyframes: media.keyframes.timestamps, timeBase: ms, hlsTime: 6, end: media.videoEndTimestamp)
+        return PlaylistBuilder(media: media, plan: plan, subtitleGrid: SubtitleGrid(totalTicks: 120_000_000))
+    }
+
+    @Test func japaneseAudioGetsTheRegularEnglishTrack() {
+        let builder = playlists(audio: ["jpn", "eng"], subtitles: [("eng", false), ("eng", true)])
+        #expect(builder.preferredSubtitleIndex(forAudio: 0, preferredLanguages: ["en-US"]) == 0)
+    }
+
+    @Test func noneWhenTheAudioIsInThePreferredLanguage() {
+        let builder = playlists(audio: ["jpn", "eng"], subtitles: [("eng", false), ("eng", true)])
+        #expect(builder.preferredSubtitleIndex(forAudio: 1, preferredLanguages: ["en-US", "ja"]) == nil)
+    }
+
+    @Test func laterPreferencesAndNoMatch() {
+        let builder = playlists(audio: ["jpn", "eng"], subtitles: [("fre", false), ("eng", true)])
+        #expect(builder.preferredSubtitleIndex(forAudio: 0, preferredLanguages: ["en-US", "fr-FR"]) == 0)
+        // The only English track is forced: no regular one to take its place.
+        #expect(builder.preferredSubtitleIndex(forAudio: 0, preferredLanguages: ["en-US"]) == nil)
+    }
+}
