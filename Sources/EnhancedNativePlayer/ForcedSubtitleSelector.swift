@@ -59,17 +59,7 @@ final class ForcedSubtitleSelector {
             guard wanted != current else { return }
             let option = wanted.flatMap { name in legible.options.first { $0.renditionName == name } }
             Logger.player.info("Forced subtitles for \(audio): \(option?.renditionName ?? "none")")
-            item.selectSubtitle(option, in: legible)
+            item.select(option, in: legible)
         }
-    }
-}
-
-extension AVPlayerItem {
-    /// Selects `option` in the subtitle group, or turns subtitles off for nil. A track is
-    /// selected twice: on tvOS a single selection of the track the menu already shows (one that
-    /// was deselected, so the menu kept it with the switch off) draws it but leaves the switch off.
-    func selectSubtitle(_ option: AVMediaSelectionOption?, in group: AVMediaSelectionGroup) {
-        select(option, in: group)
-        if option != nil { select(option, in: group) }
     }
 }

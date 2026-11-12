@@ -289,7 +289,6 @@ final class ASSRenderEngine: @unchecked Sendable {
 
 #if canImport(UIKit) && !os(watchOS)
 import Logging
-import MediaAccessibility
 import UIKit
 
 /// Draws the selected ASS track with libass in `AVPlayerViewController.contentOverlayView`,
@@ -413,9 +412,6 @@ final class ASSSubtitleRenderer {
             // The group only exists once the master playlist has been read.
             guard let group = try? await item.asset.loadMediaSelectionGroup(for: .legible), let self, self.item === item else { return }
             let option = item.currentMediaSelection.selectedMediaOption(in: group)
-            // What the tvOS subtitles switch changes: the selection, the caption display type, or neither.
-            let display = MACaptionAppearanceGetDisplayType(.user)
-            Logger.player.info("ASS renderer sees subtitles \(option?.renditionName ?? "none"), caption display type \(display.rawValue) (0 forced only, 1 automatic, 2 always on)")
             self.select(track: option?.renditionName.flatMap { self.session.assTrack(named: $0) })
         }
     }

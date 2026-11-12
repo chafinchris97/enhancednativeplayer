@@ -63,6 +63,8 @@ public final class EnhancedPlayer {
     public private(set) var selectedSubtitleTrackIndex: Int?
     /// The file's own chapters, known once the file is open. Shown unless the view sets others.
     public private(set) var fileChapters: [Chapter] = []
+    /// The subtitle tracks' names, external tracks first, for the transport bar's subtitles menu.
+    private(set) var subtitleTrackNames: [String] = []
 
     private let url: URL
     private let configuration: EnhancedPlayerConfiguration
@@ -230,11 +232,7 @@ public final class EnhancedPlayer {
             Logger.player.warning("No rendition named \(name!)")
             return
         }
-        if characteristic == .legible {
-            item.selectSubtitle(option, in: group)
-        } else {
-            item.select(option, in: group)
-        }
+        item.select(option, in: group)
     }
 
     // MARK: Presentation
@@ -387,6 +385,7 @@ public final class EnhancedPlayer {
     private func sessionDidOpen(_ session: EnhancedPlaybackSession) {
         duration = session.duration
         fileChapters = session.fileChapters
+        subtitleTrackNames = session.subtitleTrackNames
         if let audio = startSelection.audio, !session.audioTrackNames.indices.contains(audio) {
             Logger.player.warning("Audio track \(audio) does not exist (\(session.audioTrackNames.count) tracks); starting with the default")
             startSelection.audio = nil
