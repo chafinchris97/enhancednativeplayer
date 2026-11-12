@@ -623,7 +623,7 @@ public final class EnhancedPlayer {
                     if self.isReady { self.startPosition = nil }
                 case .failed:
                     guard let error = item.error else { return }
-                    if master == session.masterPlaylistURL, let sdrMaster = session.sdrMasterPlaylistURL, DisplayRefusal.matches(error) {
+                    if master == session.masterPlaylistURL, let sdrMaster = session.sdrMasterPlaylistURL, DisplayRefusal.matches(error, iFramePlaylistWithheld: session.iFramePlaylistWithheld) {
                         let nsError = error as NSError
                         Logger.player.info("HDR master refused (\(nsError.domain) \(nsError.code)), playing the SDR master")
                         self.begin(session, master: sdrMaster)

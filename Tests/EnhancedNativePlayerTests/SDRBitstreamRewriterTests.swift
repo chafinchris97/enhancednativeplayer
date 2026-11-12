@@ -251,6 +251,9 @@ struct DisplayRefusalTests {
         #expect(!DisplayRefusal.matches(NSError(domain: AVFoundationErrorDomain, code: -11800)))
         #expect(!DisplayRefusal.matches(NSError(domain: NSURLErrorDomain, code: NSURLErrorTimedOut)))
         #expect(!DisplayRefusal.matches(NSError(domain: "CoreMediaErrorDomain", code: -11868)))
+        // A 404 on iframe.m3u8 is the refusal only when the server withheld it.
+        #expect(DisplayRefusal.matches(NSError(domain: NSURLErrorDomain, code: NSURLErrorFileDoesNotExist), iFramePlaylistWithheld: true))
+        #expect(!DisplayRefusal.matches(NSError(domain: NSURLErrorDomain, code: NSURLErrorFileDoesNotExist)))
     }
 }
 

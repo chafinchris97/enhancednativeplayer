@@ -279,6 +279,10 @@ final class EnhancedPlaybackSession: Sendable {
     /// Whether the player decodes and draws the video itself, above a placeholder rendition.
     var rendersVideo: Bool { core.context.media.video.rendered != nil }
 
+    /// Whether `iframe.m3u8` was answered 404 because no video was asked for: the display
+    /// refused the HDR variant, and the item failing on the missing playlist stands for that.
+    var iFramePlaylistWithheld: Bool { core.iFramePlaylistWithheld.withLock { $0 } }
+
     /// The rendered video's shape on screen: its size with the pixel aspect applied. Nil when
     /// AVPlayer draws the video, whose `presentationSize` says the same.
     var renderedDisplaySize: CGSize? {
@@ -373,7 +377,13 @@ final class PlaybackSessionCore: Sendable {
     /// Holds a run's first video segment until the player has decoded its frame; nil unless the
     /// player draws the video.
     let videoGate: VideoStartGate?
+    /// Set by the first request for a video init or segment, of either master.
+    private let videoRequested = Mutex(false)
+    let iFramePlaylistWithheld = Mutex(false)
     private let logger: Logger
+
+    /// How long `iframe.m3u8` waits for a video request before it is withheld.
+    static let iFramePlaylistWaitSeconds: Double = 3
 
     init(context: RemuxContext, directory: URL, segmentsAhead: Int, externalFonts: [ASSFont] = [], trickplay: TrickplayRendition? = nil, logger: Logger) {
         self.context = context
@@ -429,6 +439,12 @@ final class PlaybackSessionCore: Sendable {
     func respond(to fileName: String, runtimeTicks: Int64?) async throws -> Response {
         guard let route = HLSRoute(fileName: fileName) else { return Response(status: .notFound) }
         let context = context
+        switch route {
+        case .videoInit, .videoSegment, .sdrVideoInit, .sdrVideoSegment:
+            videoRequested.withLock { $0 = true }
+        default:
+            break
+        }
         do {
             switch route {
             case .master:
@@ -507,6 +523,15 @@ final class PlaybackSessionCore: Sendable {
                 return .webVTT(WebVTT.document(cues))
             case .iFramePlaylist:
                 guard let text = playlists.iFramePlaylist() else { return Response(status: .notFound) }
+                // The JPEGs are SDR, so in an HDR master on an SDR display the I-frame entry
+                // is the one thing left, and AVPlayer would play the stills as the video
+                // instead of refusing the master. Held until a video file is asked for, which
+                // says the video variant was taken; without one the item fails on the 404.
+                if context.sdrRewriter != nil, !(await waitForVideoRequest()) {
+                    iFramePlaylistWithheld.withLock { $0 = true }
+                    logger.info("iframe.m3u8 withheld: no video asked for within \(Self.iFramePlaylistWaitSeconds) s, so the video variant was refused")
+                    return Response(status: .notFound)
+                }
                 return .playlist(text)
             case .iFrameInit:
                 guard let trickplay = playlists.trickplay else { return Response(status: .notFound) }
@@ -523,6 +548,15 @@ final class PlaybackSessionCore: Sendable {
             }
             return Response(status: .internalServerError)
         }
+    }
+
+    private func waitForVideoRequest() async -> Bool {
+        let deadline = ContinuousClock.now + .seconds(Self.iFramePlaylistWaitSeconds)
+        while !videoRequested.withLock({ $0 }) {
+            guard ContinuousClock.now < deadline, !context.token.isCancelled else { return false }
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+        return true
     }
 
     /// The segment's file, sent once `hold` (if any) has returned; the two run side by side.
