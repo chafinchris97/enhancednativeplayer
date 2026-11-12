@@ -12,7 +12,8 @@ import Foundation
 ///
 /// The frames were encoded once, 64×64 and tagged like the source: H.264 Rec. 709 for SDR,
 /// HEVC Main 10 BT.2020 with PQ or HLG for HDR, so the master's `VIDEO-RANGE` and the stream
-/// agree and the display switches to HDR for an HDR file.
+/// agree and the display switches to HDR for an HDR file. An HDR file's `master_sdr.m3u8`
+/// carries the SDR stream; the frames drawn above it are the same either way.
 enum PlaceholderVideo {
     struct Stream: Sendable {
         var codec: VideoCodec
@@ -123,9 +124,10 @@ enum PlaceholderVideo {
         return packet
     }
 
-    /// `init_video.mp4`: the moov movenc writes for the placeholder's first frame.
-    static func initSegment(_ context: RemuxContext) throws -> Data {
-        let video = context.media.video
+    /// `init_video.mp4` (`init_video_sdr.mp4` with `sdr`): the moov movenc writes for the
+    /// placeholder's first frame.
+    static func initSegment(_ context: RemuxContext, sdr: Bool = false) throws -> Data {
+        let video = sdr ? context.media.video.sdrVariant : context.media.video
         let writer = try FragmentedMP4Writer { try configure($0, video: video) }
         let packet = try packet(for: video)
         packet.pts = 0
@@ -165,9 +167,11 @@ enum PlaceholderVideo {
 /// plan's cuts, on the same output clock as the audio. Nothing is read from the file.
 struct PlaceholderVideoProducer: SegmentProducer {
     let context: RemuxContext
+    /// Set for the `video_sdr_{n}.mp4` rendition.
+    var sdr = false
 
     func produce(_ run: RemuxRun) throws {
-        let video = context.media.video
+        let video = sdr ? context.media.video.sdrVariant : context.media.video
         let writer = try FragmentedMP4Writer { try PlaceholderVideo.configure($0, video: video) }
         let emitter = SegmentEmitter(writer: writer, run: run, segmentCount: context.plan.count)
         let inTB = video.timeBase

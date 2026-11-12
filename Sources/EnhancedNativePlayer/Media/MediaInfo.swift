@@ -71,12 +71,19 @@ struct VideoTrack: Sendable {
 
     /// The same track as it is described once `SDRBitstreamRewriter` has relabeled it.
     /// `hvcC` / `avcC` keep their profile and level fields, so `extradata` still gives
-    /// the right `CODECS` string.
+    /// the right `CODECS` string. For rendered video, the SDR placeholder's stream.
     var sdrVariant: VideoTrack {
         var track = self
         track.range = .sdr
         track.dolbyVision = nil
         track.hdr10Plus = false
+        if rendered != nil {
+            let placeholder = PlaceholderVideo.sdr
+            track.codec = placeholder.codec
+            track.extradata = placeholder.record
+            track.profile = placeholder.profile
+            track.level = placeholder.level
+        }
         return track
     }
 

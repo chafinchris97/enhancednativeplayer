@@ -48,6 +48,37 @@ struct VideoRouteTests {
     }
 }
 
+/// An HDR file the player draws has an SDR master too: its variant is the H.264 SDR placeholder,
+/// so on an SDR display AVPlayer has a video variant to take instead of the I-frame entry.
+struct RenderedSDRMasterTests {
+    @Test(arguments: [VideoRange.pq, .hlg]) func sdrMasterCarriesTheSDRPlaceholder(range: VideoRange) {
+        let ms = Rational(num: 1, den: 1000)
+        let placeholder = PlaceholderVideo.stream(for: range)
+        let video = VideoTrack(
+            streamIndex: 0, codec: placeholder.codec, timeBase: ms, width: 3840, height: 2160, frameRate: 24,
+            frameDuration: 42, reorderDepth: 0, bitRate: nil, range: range, dolbyVision: nil,
+            extradata: placeholder.record, profile: placeholder.profile, level: placeholder.level,
+            rendered: RenderedVideoSource(
+                codecID: AV_CODEC_ID_AV1.rawValue, codecName: "av1", pixelFormat: AV_PIX_FMT_YUV420P10LE.rawValue,
+                sampleAspect: Rational(num: 1, den: 1), colorPrimaries: 9, colorTransfer: range == .pq ? 16 : 18, colorSpace: 9, colorRange: 1
+            )
+        )
+        let media = MediaInfo(
+            formatName: "matroska", fileSize: 1_000_000, durationSeconds: 12, bitRate: nil, video: video,
+            audio: [], subtitles: [],
+            keyframes: KeyframeIndex(timestamps: [0, 6000], positions: [0, 1], timeBase: ms, usesDecodeTimestamps: false, presentationOffset: 0),
+            videoEndTimestamp: 12000
+        )
+        let plan = SegmentPlan(keyframes: media.keyframes.timestamps, timeBase: ms, hlsTime: 6, end: media.videoEndTimestamp)
+        let playlists = PlaylistBuilder(media: media, plan: plan, subtitleGrid: SubtitleGrid(totalTicks: 120_000_000))
+        let hdr = playlists.master().split(separator: "\n").filter { $0.hasPrefix("#EXT-X-STREAM-INF:") }
+        let sdr = playlists.master(sdr: true).split(separator: "\n").filter { $0.hasPrefix("#EXT-X-STREAM-INF:") }
+        #expect(hdr.count == 1 && hdr[0].contains("CODECS=\"hvc1.2.4.L30.90") && hdr[0].contains("VIDEO-RANGE=\(range.rawValue)"))
+        #expect(sdr.count == 1 && sdr[0].contains("CODECS=\"avc1.42C00A\"") && sdr[0].contains("VIDEO-RANGE=SDR"))
+        #expect(video.sdrVariant.rendered != nil)
+    }
+}
+
 /// Opt-in: files whose video the player decodes, served over HTTP with range support.
 ///
 ///     ENP_RENDER_URLS=http://127.0.0.1:18931/av1.mkv,http://127.0.0.1:18931/vc1.mkv swift test --filter RenderedVideo
@@ -63,6 +94,7 @@ struct RenderedVideoEndToEndTests {
         let master = try String(contentsOf: base.appendingPathComponent("master.m3u8"), encoding: .utf8)
         print(master)
         #expect(master.contains(session.isHDR ? "CODECS=\"hvc1.2.4.L30.90" : "CODECS=\"avc1.42C00A"))
+        #expect((session.sdrMasterPlaylistURL != nil) == session.isHDR)
 
         let item = AVPlayerItem(url: session.masterPlaylistURL)
         let player = AVPlayer(playerItem: item)

@@ -13,8 +13,9 @@ final class EnhancedPlaybackSession: Sendable {
     /// `http://127.0.0.1:{port}/master.m3u8`
     let masterPlaylistURL: URL
     /// `http://127.0.0.1:{port}/master_sdr.m3u8`: the same stream with the video relabeled
-    /// as Rec. 709 and its HDR metadata removed, for playing HDR on an SDR display. Nil
-    /// when the file is not HDR, or its codec configuration cannot be rewritten.
+    /// as Rec. 709 and its HDR metadata removed, for playing HDR on an SDR display; for video
+    /// the player draws, the SDR placeholder under the same frames. Nil when the file is
+    /// not HDR, or its codec configuration cannot be rewritten.
     let sdrMasterPlaylistURL: URL?
     /// Whether the file's video is HDR10, HLG or Dolby Vision.
     let isHDR: Bool
@@ -36,7 +37,7 @@ final class EnhancedPlaybackSession: Sendable {
 
     private init(masterPlaylistURL: URL, core: PlaybackSessionCore, server: HLSServer) {
         self.masterPlaylistURL = masterPlaylistURL
-        self.sdrMasterPlaylistURL = core.context.sdrRewriter == nil ? nil : masterPlaylistURL.deletingLastPathComponent().appendingPathComponent("master_sdr.m3u8")
+        self.sdrMasterPlaylistURL = !core.context.hasSDRMaster ? nil : masterPlaylistURL.deletingLastPathComponent().appendingPathComponent("master_sdr.m3u8")
         self.isHDR = core.context.media.video.isHDR
         self.core = core
         self.server = server
@@ -416,7 +417,9 @@ final class PlaybackSessionCore: Sendable {
             token: context.token,
             logger: logger,
             fileName: { segment, _ in "video_sdr_\(segment).mp4" },
-            producer: { _ in VideoProducer(context: context, rewriter: context.sdrRewriter) }
+            producer: { _ -> SegmentProducer in
+                context.media.video.rendered == nil ? VideoProducer(context: context, rewriter: context.sdrRewriter) : PlaceholderVideoProducer(context: context, sdr: true)
+            }
         )
         audio = SegmentPipeline(
             name: "audio",
@@ -485,17 +488,20 @@ final class PlaybackSessionCore: Sendable {
                 checkTicks(runtimeTicks, index: index, file: fileName)
                 return try await serve(index, track: track, from: audio, audio: true)
             case .sdrMaster:
-                guard context.sdrRewriter != nil else { return Response(status: .notFound) }
+                guard context.hasSDRMaster else { return Response(status: .notFound) }
                 return .playlist(playlists.master(sdr: true, start: startSelection.withLock { $0 }))
             case .sdrVideoPlaylist:
-                guard context.sdrRewriter != nil else { return Response(status: .notFound) }
+                guard context.hasSDRMaster else { return Response(status: .notFound) }
                 return .playlist(playlists.sdrVideoPlaylist())
             case .sdrVideoInit:
-                guard let rewriter = context.sdrRewriter else { return Response(status: .notFound) }
+                guard context.hasSDRMaster else { return Response(status: .notFound) }
                 let token = context.token
-                return .mp4(try await inits.data(for: "video-sdr") { try InitSegmentBuilder.video(context, rewriter: rewriter, token: token) }, audio: false)
+                return .mp4(try await inits.data(for: "video-sdr") {
+                    guard let rewriter = context.sdrRewriter else { return try PlaceholderVideo.initSegment(context, sdr: true) }
+                    return try InitSegmentBuilder.video(context, rewriter: rewriter, token: token)
+                }, audio: false)
             case .sdrVideoSegment(let index):
-                guard context.sdrRewriter != nil else { return Response(status: .notFound) }
+                guard context.hasSDRMaster else { return Response(status: .notFound) }
                 checkTicks(runtimeTicks, index: index, file: fileName)
                 return try await serve(index, track: 0, from: sdrVideo, audio: false)
             case .subtitlePlaylist(let track):
@@ -527,7 +533,7 @@ final class PlaybackSessionCore: Sendable {
                 // is the one thing left, and AVPlayer would play the stills as the video
                 // instead of refusing the master. Held until a video file is asked for, which
                 // says the video variant was taken; without one the item fails on the 404.
-                if context.sdrRewriter != nil, !(await waitForVideoRequest()) {
+                if context.hasSDRMaster, !(await waitForVideoRequest()) {
                     iFramePlaylistWithheld.withLock { $0 = true }
                     logger.info("iframe.m3u8 withheld: no video asked for within \(Self.iFramePlaylistWaitSeconds) s, so the video variant was refused")
                     return Response(status: .notFound)

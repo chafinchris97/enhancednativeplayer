@@ -31,6 +31,9 @@ final class RemuxContext: Sendable {
     let token: CancellationToken
     /// Set when the video is HDR and can be relabeled for `master_sdr.m3u8`.
     let sdrRewriter: SDRBitstreamRewriter?
+    /// Whether there is a `master_sdr.m3u8`: HDR video that is relabeled, or HDR video the
+    /// player draws, whose SDR master carries the SDR placeholder.
+    let hasSDRMaster: Bool
 
     init(file: RemoteFile, media: MediaInfo, plan: SegmentPlan, token: CancellationToken) {
         self.file = file
@@ -40,6 +43,7 @@ final class RemuxContext: Sendable {
         self.token = token
         // Rendered video has no bitstream in the playlist to relabel.
         self.sdrRewriter = media.video.isHDR && media.video.rendered == nil ? SDRBitstreamRewriter(codec: media.video.codec, extradata: media.video.extradata) : nil
+        self.hasSDRMaster = media.video.isHDR && (media.video.rendered != nil || sdrRewriter != nil)
         self.timeline = Timeline(videoTimeBase: media.keyframes.timeBase, originPresentation: plan.origin + presentationShift(media))
     }
 
