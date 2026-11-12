@@ -1,4 +1,7 @@
 #if canImport(UIKit) && !os(watchOS)
+#if os(tvOS)
+import Accessibility
+#endif
 import AVKit
 import MediaAccessibility
 import Observation
@@ -257,7 +260,15 @@ extension PlayerHostViewController {
                 menuRef?.subtitle = name(id)
             })
         }
-        let menu = UIMenu(title: "Style", subtitle: ids.contains(active) ? name(active) : nil, options: .singleSelection, children: styles)
+        var children: [UIMenuElement] = [UIMenu(options: [.displayInline, .singleSelection], children: styles)]
+        if #available(tvOS 26.4, *), AccessibilitySettings.canOpenSettings(for: .captionStyles) {
+            // Below the styles, as in AVKit's menu: opens the caption styles in Settings.
+            let manage = UIAction(title: "Manage Styles", image: UIImage(systemName: "gear")) { _ in
+                Task { try? await AccessibilitySettings.openSettings(for: .captionStyles) }
+            }
+            children.append(UIMenu(options: .displayInline, children: [manage]))
+        }
+        let menu = UIMenu(title: "Style", subtitle: ids.contains(active) ? name(active) : nil, children: children)
         menuRef = menu
         return menu
     }
