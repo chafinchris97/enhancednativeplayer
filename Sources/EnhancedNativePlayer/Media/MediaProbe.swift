@@ -164,7 +164,8 @@ enum MediaProbe {
             dolbyVision: dolbyVision,
             extradata: par.extradataBytes,
             profile: par.pointee.profile,
-            level: par.pointee.level
+            level: par.pointee.level,
+            hdrMetadata: range == .sdr ? nil : HDRStaticMetadata(par)
         )
     }
 

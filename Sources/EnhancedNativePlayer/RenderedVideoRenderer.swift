@@ -62,7 +62,7 @@ final class RenderedVideoRenderer {
     }
 
     private func start(item: AVPlayerItem, timebase: CMTimebase) {
-        let renderer = view.attach(timebase: timebase)
+        let renderer = view.install(timebase: timebase)
         let session = session
         let token = CancellationToken(parent: session.cancellationToken)
         let size = session.videoSize
@@ -107,7 +107,7 @@ final class RenderedVideoRenderer {
         feeder?.stop()
         feeder = nil
         // The layer runs on this item's timebase, so it goes with the item.
-        view.attach(timebase: nil)
+        view.remove()
         item = nil
     }
 
@@ -117,10 +117,11 @@ final class RenderedVideoRenderer {
     }
 }
 
-/// Places the `AVSampleBufferDisplayLayer` the decoded frames are shown in, and keeps it the
-/// player's size. The view itself sits in `contentOverlayView`, which is always the player's size;
-/// it only shows anything when the layer had to go in it.
-private final class RenderedVideoView: UIView {
+/// Places the `AVSampleBufferDisplayLayer` the player's own frames are shown in (decoded ones,
+/// or AVPlayer's tone mapped), and keeps it the player's size. The view itself sits in
+/// `contentOverlayView`, which is always the player's size; it only shows anything when the
+/// layer had to go in it.
+final class RenderedVideoView: UIView {
     weak var playerView: UIView?
     private var displayLayer: AVSampleBufferDisplayLayer?
 
@@ -137,33 +138,39 @@ private final class RenderedVideoView: UIView {
         fatalError("init(coder:) is not supported")
     }
 
-    /// A new layer on `timebase`, or none. Returns the layer's renderer.
-    @discardableResult
-    func attach(timebase: CMTimebase?) -> AVSampleBufferVideoRenderer {
+    /// A new layer, replacing the one before, on `timebase` or showing each frame as it is
+    /// enqueued. Returns the layer's renderer.
+    func install(timebase: CMTimebase?) -> AVSampleBufferVideoRenderer {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        remove()
+        let displayLayer = AVSampleBufferDisplayLayer()
+        displayLayer.videoGravity = .resizeAspect
+        // Covers AVPlayer's own picture.
+        displayLayer.backgroundColor = UIColor.black.cgColor
+        if let timebase { displayLayer.controlTimebase = timebase }
+        if let (parent, subtitles) = playerView.flatMap(Self.subtitleSlot) {
+            parent.insertSublayer(displayLayer, below: subtitles)
+            displayLayer.frame = parent.bounds
+        } else {
+            backgroundColor = .black
+            layer.addSublayer(displayLayer)
+            displayLayer.frame = bounds
+        }
+        self.displayLayer = displayLayer
+        CATransaction.commit()
+        return displayLayer.sampleBufferRenderer
+    }
+
+    /// Takes the layer away, if there is one.
+    func remove() {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         displayLayer?.sampleBufferRenderer.flush(removingDisplayedImage: true, completionHandler: nil)
         displayLayer?.removeFromSuperlayer()
         displayLayer = nil
         backgroundColor = nil
-        let displayLayer = AVSampleBufferDisplayLayer()
-        if let timebase {
-            displayLayer.videoGravity = .resizeAspect
-            // Covers AVPlayer's placeholder picture.
-            displayLayer.backgroundColor = UIColor.black.cgColor
-            displayLayer.controlTimebase = timebase
-            if let (parent, subtitles) = playerView.flatMap(Self.subtitleSlot) {
-                parent.insertSublayer(displayLayer, below: subtitles)
-                displayLayer.frame = parent.bounds
-            } else {
-                backgroundColor = .black
-                layer.addSublayer(displayLayer)
-                displayLayer.frame = bounds
-            }
-            self.displayLayer = displayLayer
-        }
         CATransaction.commit()
-        return displayLayer.sampleBufferRenderer
     }
 
     /// The layer AVPlayer draws its picture and subtitles in, and the subtitle layer inside it:

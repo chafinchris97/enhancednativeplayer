@@ -90,6 +90,9 @@ public final class EnhancedPlayer {
     @ObservationIgnored private var pgsRenderer: PGSSubtitleRenderer?
     @ObservationIgnored private var assRenderer: ASSSubtitleRenderer?
     @ObservationIgnored private var videoRenderer: RenderedVideoRenderer?
+    @ObservationIgnored private var toneMapper: ToneMappedVideoRenderer?
+    /// Whether the current item plays `master_sdr.m3u8`.
+    @ObservationIgnored private var playsSDRMaster = false
     @ObservationIgnored private var forcedSubtitles: ForcedSubtitleSelector?
     @ObservationIgnored private var audioSessionActive = false
     #if os(tvOS)
@@ -419,6 +422,9 @@ public final class EnhancedPlayer {
         assRenderer = nil
         videoRenderer?.stop()
         videoRenderer = nil
+        toneMapper?.stop()
+        toneMapper = nil
+        playsSDRMaster = false
         forcedSubtitles?.stop()
         forcedSubtitles = nil
         avPlayer.pause()
@@ -527,6 +533,7 @@ public final class EnhancedPlayer {
         isReady = false
         let item = AVPlayerItem(url: master)
         self.item = item
+        playsSDRMaster = master == session.sdrMasterPlaylistURL
         appliedMetadata = nil
         appliedChapters = nil
         applyPresentation(to: item)
@@ -580,8 +587,19 @@ public final class EnhancedPlayer {
             assRenderer = nil
             videoRenderer?.stop()
             videoRenderer = nil
+            toneMapper?.stop()
+            toneMapper = nil
         }
         guard let host, let overlay = host.playerViewController.contentOverlayView else { return }
+        // The SDR master's video is relabeled HDR: shown tone mapped over AVPlayer's picture.
+        if playsSDRMaster, let color = session.sdrMasterSourceColor {
+            let renderer = toneMapper ?? ToneMappedVideoRenderer(color: color, playerView: host.playerViewController.view, container: overlay)
+            toneMapper = renderer
+            renderer.attach(item: item)
+        } else {
+            toneMapper?.stop()
+            toneMapper = nil
+        }
         if session.rendersVideo {
             // Below the subtitles: it puts itself at the bottom of the overlay.
             let renderer = videoRenderer ?? RenderedVideoRenderer(session: session, playerView: host.playerViewController.view, container: overlay)

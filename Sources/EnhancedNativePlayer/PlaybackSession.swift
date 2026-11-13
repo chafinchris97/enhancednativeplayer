@@ -280,6 +280,14 @@ final class EnhancedPlaybackSession: Sendable {
     /// Whether the player decodes and draws the video itself, above a placeholder rendition.
     var rendersVideo: Bool { core.context.media.video.rendered != nil }
 
+    /// The colour `master_sdr.m3u8` relabeled away, which the player puts back on AVPlayer's
+    /// frames so they are tone mapped. Nil when the SDR master isn't a relabel.
+    var sdrMasterSourceColor: SourceHDRColor? {
+        let video = core.context.media.video
+        guard core.context.sdrRewriter != nil else { return nil }
+        return SourceHDRColor(range: video.range, metadata: video.hdrMetadata)
+    }
+
     /// Whether `iframe.m3u8` was answered 404 because no video was asked for: the display
     /// refused the HDR variant, and the item failing on the missing playlist stands for that.
     var iFramePlaylistWithheld: Bool { core.iFramePlaylistWithheld.withLock { $0 } }

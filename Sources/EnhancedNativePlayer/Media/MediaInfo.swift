@@ -59,6 +59,9 @@ struct VideoTrack: Sendable {
     var rendered: RenderedVideoSource? = nil
     /// HEVC PQ video carrying HDR10+ SEI, which the master announces with the `cdm4` brand.
     var hdr10Plus = false
+    /// The container's mastering display and content light level, for tone mapping the
+    /// SDR master's video.
+    var hdrMetadata: HDRStaticMetadata? = nil
 
     /// Dolby Vision profiles 5 and 8, which AVPlayer decodes natively. Profile 7 is dual-layer and unsupported, so it rides `hvc1` as plain HDR10.
     var emitsDolbyVision: Bool {
