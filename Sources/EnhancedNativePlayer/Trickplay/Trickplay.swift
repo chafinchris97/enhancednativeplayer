@@ -22,7 +22,7 @@ public struct Trickplay: Hashable, Sendable {
     public var interval: Int
     /// Bits per second the sheets average over the file's duration.
     public var bandwidth: Int
-    /// Every sheet, in order, fetched with the player's headers. All but the last are full.
+    /// Every sheet, in order, fetched with the media's headers. All but the last are full.
     public var sheets: [URL]
 
     public init(width: Int, height: Int, tileWidth: Int, tileHeight: Int, interval: Int, bandwidth: Int, sheets: [URL]) {

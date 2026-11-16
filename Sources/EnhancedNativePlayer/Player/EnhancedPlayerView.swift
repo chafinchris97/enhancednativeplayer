@@ -11,79 +11,41 @@ import UIKit
 /// Shows an `EnhancedPlayer` with the system player controls, the way `VideoPlayer` shows an `AVPlayer`.
 ///
 /// ```swift
-/// EnhancedPlayerView(player: player)
-///     .metadata(title: "Dune", description: "…", artwork: .url(posterURL))
-///     .chapters([
-///         Chapter(title: "Opening", start: 0),
-///         Chapter(title: "Arrakis", start: 754),
-///     ])
+/// EnhancedPlayerView(player)
 ///     .ignoresSafeArea()
+///     .task(id: media) {
+///         try? await player.load(media)
+///         player.play()
+///     }
 /// ```
 ///
-/// Playback starts its session when the view appears and ends it when the view goes away,
+/// What the info panel, Now Playing and the chapter list show comes from the loaded
+/// `EnhancedMedia`. Showing the view opens the loaded media and going away ends its session,
 /// wherever the view is: a full-screen cover, a sheet, a navigation push or a whole window.
 ///
 /// Keep the player in `@State` (or in a model that outlives the view). A player created anew
 /// each time the parent's body runs would start a new session each time.
 public struct EnhancedPlayerView: View {
     private let player: EnhancedPlayer
-    private var metadata: PlayerMetadata?
-    private var chapters: [Chapter]?
 
-    public init(player: EnhancedPlayer) {
+    public init(_ player: EnhancedPlayer) {
         self.player = player
     }
 
     public var body: some View {
-        PlayerRepresentable(player: player, metadata: metadata, chapters: chapters)
-    }
-
-    /// What the info panel and Now Playing show. Every value is optional; a later call replaces
-    /// the whole set, and only what changed is rewritten.
-    public func metadata(
-        title: String? = nil,
-        subtitle: String? = nil,
-        description: String? = nil,
-        artwork: Artwork? = nil,
-        genre: String? = nil,
-        contentRating: String? = nil,
-        releaseDate: Date? = nil
-    ) -> EnhancedPlayerView {
-        var view = self
-        view.metadata = PlayerMetadata(
-            title: title,
-            subtitle: subtitle,
-            description: description,
-            artwork: artwork,
-            genre: genre,
-            contentRating: contentRating,
-            releaseDate: releaseDate
-        )
-        return view
-    }
-
-    /// Replaces the file's own chapters, which show when this isn't used. An empty array
-    /// shows no chapters. Shown in the tvOS transport bar; iOS has no chapter UI.
-    public func chapters(_ chapters: [Chapter]) -> EnhancedPlayerView {
-        var view = self
-        view.chapters = chapters
-        return view
+        PlayerRepresentable(player: player)
     }
 }
 
 private struct PlayerRepresentable: UIViewControllerRepresentable {
     let player: EnhancedPlayer
-    let metadata: PlayerMetadata?
-    let chapters: [Chapter]?
 
     func makeUIViewController(context: Context) -> PlayerHostViewController {
-        player.setPresentation(metadata: metadata, chapters: chapters)
-        return PlayerHostViewController(player: player)
+        PlayerHostViewController(player: player)
     }
 
     func updateUIViewController(_ controller: PlayerHostViewController, context: Context) {
         controller.show(player)
-        player.setPresentation(metadata: metadata, chapters: chapters)
     }
 
     static func dismantleUIViewController(_ controller: PlayerHostViewController, coordinator: ()) {
@@ -215,7 +177,7 @@ extension PlayerHostViewController {
     /// checkmarks whenever the selection changes.
     private func updateSubtitlesMenu() {
         let (names, playerSelection) = withObservationTracking {
-            (player.subtitleTrackNames, player.selectedSubtitleTrackIndex)
+            (player.subtitleTracks.map(\.name), player.selectedSubtitleTrack?.index)
         } onChange: { [weak self] in
             Task { @MainActor [weak self] in self?.updateSubtitlesMenu() }
         }
@@ -240,7 +202,8 @@ extension PlayerHostViewController {
     /// A pick in the subtitles menu: the menu shows it at once, before AVPlayer has applied it.
     private func chooseSubtitle(_ index: Int?) {
         chosenSubtitle = .some(index)
-        if let index { player.selectSubtitleTrack(index: index) } else { player.turnOffSubtitles() }
+        let tracks = player.subtitleTracks
+        player.selectedSubtitleTrack = index.flatMap { tracks.indices.contains($0) ? tracks[$0] : nil }
         updateSubtitlesMenu()
     }
 

@@ -100,7 +100,7 @@ enum MediaProbe {
             }
             let start = timeBase.doubleValue * Double(chapter.pointee.start)
             let end = chapter.pointee.end > chapter.pointee.start ? timeBase.doubleValue * Double(chapter.pointee.end) : nil
-            chapters.append(Chapter(title: title.isEmpty ? "Chapter \(i + 1)" : title, start: start, end: end))
+            chapters.append(Chapter(title: title.isEmpty ? "Chapter \(i + 1)" : title, start: .seconds(start), end: end.map { .seconds($0) }))
         }
         return chapters.sorted { $0.start < $1.start }
     }

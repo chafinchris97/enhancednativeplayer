@@ -25,6 +25,10 @@ final class EnhancedPlaybackSession: Sendable {
     let audioTrackNames: [String]
     /// The `NAME` of each subtitle rendition, in `subtitle_{n}` order.
     let subtitleTrackNames: [String]
+    /// The audio tracks as the player reports them, in `audio_{n}` order.
+    let audioTracks: [MediaTrack]
+    /// The subtitle tracks as the player reports them, in `subtitle_{n}` order.
+    let subtitleTracks: [MediaTrack]
     /// Where the playlist timeline starts in the file's timeline, in seconds. AVPlayer's
     /// time plus this is the file's time.
     let originSeconds: TimeInterval
@@ -44,6 +48,14 @@ final class EnhancedPlaybackSession: Sendable {
         self.duration = core.context.plan.segments.reduce(0) { $0 + $1.duration }
         self.audioTrackNames = core.playlists.audioNames()
         self.subtitleTrackNames = core.playlists.subtitleNames()
+        let audioNames = audioTrackNames
+        let subtitleNames = subtitleTrackNames
+        self.audioTracks = core.context.media.audio.map { track in
+            MediaTrack(index: track.index, name: audioNames[track.index], language: track.language)
+        }
+        self.subtitleTracks = core.context.media.subtitles.map { track in
+            MediaTrack(index: track.index, name: subtitleNames[track.index], language: track.language, isForced: track.isForced, isExternal: track.isExternal)
+        }
         self.originSeconds = Double(core.context.originTicks) / 10_000_000
         self.fileChapters = core.context.media.chapters
     }

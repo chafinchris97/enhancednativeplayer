@@ -10,33 +10,46 @@ import UIKit
 ///
 /// ```swift
 /// struct MovieView: View {
-///     @State private var player = EnhancedPlayer(url: movieURL)
+///     @State private var player = EnhancedPlayer()
+///     let media: EnhancedMedia
 ///
 ///     var body: some View {
-///         EnhancedPlayerView(player: player)
+///         EnhancedPlayerView(player)
 ///             .ignoresSafeArea()
-///             .onAppear {
+///             .task(id: media) {
+///                 try? await player.load(media, startTime: .seconds(754))
 ///                 player.play()
 ///             }
 ///     }
 /// }
 /// ```
 ///
-/// Creating a player starts nothing. When its view appears, the player probes the file, starts
-/// the local server and, on tvOS, matches the display mode; `play()` takes effect once that is
-/// done. When the view goes away the server stops, the cache is deleted and the display mode
-/// and audio session are reset. The player keeps its position, so showing it again resumes.
+/// Loading says what to play; the view showing it is what opens it. From synchronous code,
+/// such as a button's action, `load` returns at once; in async code it is the form below,
+/// which waits for the file to open. When the view appears,
+/// the player probes the file, starts the local server and, on tvOS, matches the display
+/// mode; `play()` takes effect once that is done. When the view goes away the server stops,
+/// the cache is deleted and the display mode and audio session are reset. The player keeps
+/// the media and its position, so showing it again resumes. Loading other media while the
+/// view is up ends the session and starts one for the new media.
 ///
-/// Every setting works before playback starts and after: before, it says how playback starts
-/// (`seek` sets the start position, `selectAudioTrack` the starting track); after, it acts at once.
+/// To choose tracks before playback starts, await the load, which returns once the file is
+/// open and the track lists are known, and set them before calling `play()`:
 ///
-/// Times are seconds in the file's own timeline. Track indices count from 0 in file order;
-/// subtitle indices count external subtitles first, in the order they were passed.
+/// ```swift
+/// .task(id: media) {
+///     try? await player.load(media)
+///     player.selectedSubtitleTrack = player.subtitleTracks.first { $0.language == "eng" }
+///     player.play()
+/// }
+/// ```
+///
+/// Times are in the file's own timeline.
 @MainActor
 @Observable
 public final class EnhancedPlayer {
     public enum Status: Equatable, Sendable {
-        /// Not shown, or stopped.
+        /// Nothing loaded, not shown, or stopped.
         case idle
         /// Opening the file, matching the display, or buffering.
         case loading
@@ -53,23 +66,37 @@ public final class EnhancedPlayer {
     public private(set) var status: Status = .idle
     /// Why playback failed, once `status` is `.failed`.
     public private(set) var error: (any Error)?
-    /// Seconds in the file's timeline.
-    public private(set) var currentTime: TimeInterval = 0
-    /// Length in seconds, known once the file is open.
-    public private(set) var duration: TimeInterval?
-    /// The audio track playing, or the one playback will start with.
-    public private(set) var selectedAudioTrackIndex: Int?
-    /// The subtitle track showing, or the one playback will start with. Nil: subtitles are off.
-    public private(set) var selectedSubtitleTrackIndex: Int?
-    /// The file's own chapters, known once the file is open. Shown unless the view sets others.
-    public private(set) var fileChapters: [Chapter] = []
-    /// The subtitle tracks' names, external tracks first, for the transport bar's subtitles menu.
-    private(set) var subtitleTrackNames: [String] = []
+    /// What was loaded last.
+    public private(set) var currentMedia: EnhancedMedia?
+    public private(set) var currentTime: Duration = .zero
+    /// Known once the file is open.
+    public private(set) var duration: Duration?
+    /// The chapters showing: the media's own if it has them, else the file's. Known once the file is open.
+    public private(set) var chapters: [Chapter] = []
+    /// Known once the file is open; empty until then.
+    public private(set) var audioTracks: [MediaTrack] = []
+    /// External subtitles first, then the file's own. Known once the file is open; empty until then.
+    public private(set) var subtitleTracks: [MediaTrack] = []
 
-    private let url: URL
+    /// The audio track playing. Set it to one of `audioTracks` to switch; before playback
+    /// starts, that is the track it starts with.
+    public var selectedAudioTrack: MediaTrack? {
+        get { audioSelection }
+        set { selectAudio(newValue) }
+    }
+
+    /// The subtitle track showing, nil when subtitles are off. Set it to one of
+    /// `subtitleTracks`, or to nil to turn subtitles off; a forced track for the audio's
+    /// language still shows. Before playback starts, that is what it starts with.
+    public var selectedSubtitleTrack: MediaTrack? {
+        get { subtitleSelection }
+        set { selectSubtitle(newValue) }
+    }
+
+    private var audioSelection: MediaTrack?
+    private var subtitleSelection: MediaTrack?
+
     private let configuration: EnhancedPlayerConfiguration
-    private let externalSubtitles: [ExternalSubtitle]
-    private let trickplay: Trickplay?
     /// For `deinit`, which can't reach the main actor's state.
     private let sessionForCleanup = Mutex<EnhancedPlaybackSession?>(nil)
 
@@ -77,10 +104,14 @@ public final class EnhancedPlayer {
     @ObservationIgnored private var session: EnhancedPlaybackSession?
     @ObservationIgnored private var startTask: Task<Void, Never>?
     @ObservationIgnored private var item: AVPlayerItem?
+    /// Counts loads, so an awaited load answers for its own media only.
+    @ObservationIgnored private var loadGeneration = 0
+    /// Awaited loads, answered when their file opens or fails to.
+    @ObservationIgnored private var openWaiters: [UUID: (generation: Int, continuation: CheckedContinuation<Void, any Error>)] = [:]
     /// Set once the current item's starting tracks and position are in place.
     @ObservationIgnored private var isReady = false
     @ObservationIgnored private var wantsToPlay = false
-    /// Where playback starts, in the file's timeline.
+    /// Where playback starts, in seconds of the file's timeline.
     @ObservationIgnored private var startPosition: TimeInterval?
     @ObservationIgnored private var startSelection = StartSelection()
     @ObservationIgnored private var itemObservations: [NSKeyValueObservation] = []
@@ -103,28 +134,15 @@ public final class EnhancedPlayer {
     #endif
 
     // What the view shows around the playback.
-    @ObservationIgnored private var metadata: PlayerMetadata?
-    @ObservationIgnored private var customChapters: [Chapter]?
     @ObservationIgnored private var artworkCache: [Artwork: Data] = [:]
     @ObservationIgnored private var failedArtwork: Set<Artwork> = []
     @ObservationIgnored private var artworkLoads: [Artwork: Task<Void, Never>] = [:]
     @ObservationIgnored private var appliedMetadata: MetadataState?
     @ObservationIgnored private var appliedChapters: ChapterState?
 
-    /// - Parameters:
-    ///   - url: Remote file reachable with HTTP range requests.
-    ///   - headers: Sent with every request for the file, external subtitles and artwork.
-    ///   - subtitles: External subtitle files, listed before the file's own tracks.
-    ///   - trickplay: Sprite sheets of thumbnails for scrubbing.
-    ///     Sheets are fetched with `headers` as they are needed.
-    ///   - configuration: Engine tuning. Its headers merge under `headers`.
-    public init(url: URL, headers: [String: String] = [:], subtitles: [ExternalSubtitle] = [], trickplay: Trickplay? = nil, configuration: EnhancedPlayerConfiguration = EnhancedPlayerConfiguration()) {
-        var configuration = configuration
-        configuration.httpHeaders.merge(headers) { _, new in new }
-        self.url = url
+    /// - Parameter configuration: Engine tuning, the same for everything this player loads.
+    public init(configuration: EnhancedPlayerConfiguration = EnhancedPlayerConfiguration()) {
         self.configuration = configuration
-        self.externalSubtitles = subtitles
-        self.trickplay = trickplay
         // Off for good: AVPlayer starts on the master's DEFAULT renditions and the player makes
         // every other selection itself. Under the automatic criteria the system subtitle setting
         // would decide what is drawn (with subtitles off, only FORCED renditions, which these
@@ -136,6 +154,87 @@ public final class EnhancedPlayer {
         // The view normally ends the session; this is the backstop.
         if let session = sessionForCleanup.withLock({ $0 }) {
             Task { await session.stop() }
+        }
+    }
+
+    // MARK: Loading
+
+    /// Plays `media` from now on, starting at `startTime` (the beginning when nil). Ends the
+    /// session of what was loaded before. The file opens once the view is showing; playback
+    /// waits for `play()`.
+    public func load(_ media: EnhancedMedia, startTime: Duration? = nil) {
+        replaceMedia(with: media, startTime: startTime)
+    }
+
+    /// Plays `url` from now on, with nothing else about it set.
+    public func load(_ url: URL, startTime: Duration? = nil) {
+        replaceMedia(with: EnhancedMedia(url: url), startTime: startTime)
+    }
+
+    private func replaceMedia(with media: EnhancedMedia, startTime: Duration?) {
+        teardown()
+        loadGeneration += 1
+        failWaiters(CancellationError()) { $0 != self.loadGeneration }
+        currentMedia = media
+        startPosition = startTime.map { max(0, $0.timeInterval) }
+        startSelection = StartSelection()
+        wantsToPlay = false
+        status = .idle
+        error = nil
+        currentTime = startTime ?? .zero
+        duration = nil
+        chapters = []
+        audioTracks = []
+        subtitleTracks = []
+        audioSelection = nil
+        subtitleSelection = nil
+        if host != nil { start() }
+    }
+
+    /// Loads `media` and returns once the file is open: the duration, chapters and track lists
+    /// are known, and playback has not started unless `play()` was called. Tracks selected now
+    /// are what playback starts with. Async code, such as `.task`, always calls this form.
+    ///
+    /// The file opens once the view is showing, so this waits for that too. Throws the error
+    /// opening failed with, or `CancellationError` when other media is loaded first or the
+    /// calling task is cancelled. Cancelling only stops the wait; the media stays loaded.
+    public func load(_ media: EnhancedMedia, startTime: Duration? = nil) async throws {
+        replaceMedia(with: media, startTime: startTime)
+        let generation = loadGeneration
+        let id = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                } else {
+                    openWaiters[id] = (generation, continuation)
+                }
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                self?.openWaiters.removeValue(forKey: id)?.continuation.resume(throwing: CancellationError())
+            }
+        }
+    }
+
+    /// Loads `url`, with nothing else about it set, and returns once the file is open.
+    public func load(_ url: URL, startTime: Duration? = nil) async throws {
+        try await load(EnhancedMedia(url: url), startTime: startTime)
+    }
+
+    private func answerWaiters() {
+        let waiters = openWaiters.filter { $0.value.generation == loadGeneration }
+        for (id, waiter) in waiters {
+            openWaiters[id] = nil
+            waiter.continuation.resume()
+        }
+    }
+
+    private func failWaiters(_ error: any Error, where matches: (Int) -> Bool) {
+        let waiters = openWaiters.filter { matches($0.value.generation) }
+        for (id, waiter) in waiters {
+            openWaiters[id] = nil
+            waiter.continuation.resume(throwing: error)
         }
     }
 
@@ -154,11 +253,12 @@ public final class EnhancedPlayer {
         if status != .ended, status != .failed, status != .idle { status = .paused }
     }
 
-    /// Jumps to `seconds` in the file's timeline. Before playback starts, sets where it starts.
-    public func seek(toSeconds seconds: TimeInterval) {
-        currentTime = seconds
+    /// Jumps to `time` in the file's timeline. Before playback starts, sets where it starts.
+    public func seek(to time: Duration) {
+        currentTime = time
+        let seconds = time.timeInterval
         guard isReady, let session else {
-            startPosition = seconds
+            startPosition = max(0, seconds)
             return
         }
         let target = CMTime(seconds: max(0, seconds - session.originSeconds), preferredTimescale: 600)
@@ -177,8 +277,7 @@ public final class EnhancedPlayer {
     /// seconds of decoding; a jump to a chapter's start stays exact. Otherwise where it was aimed.
     func seekTarget(afterUserNavigatedFrom old: CMTime, to target: CMTime) -> CMTime {
         guard let session, target.isNumeric, old.isNumeric else { return target }
-        let chapters = customChapters ?? fileChapters
-        if chapters.contains(where: { abs(max(0, $0.start - session.originSeconds) - target.seconds) < 0.05 }) { return target }
+        if chapters.contains(where: { abs(max(0, $0.start.timeInterval - session.originSeconds) - target.seconds) < 0.05 }) { return target }
         func ticks(_ time: CMTime) -> Int64 { CMTimeConvertScale(time, timescale: 10_000_000, method: .roundHalfAwayFromZero).value }
         guard let landing = session.keyframeLanding(target: ticks(target), current: ticks(old)) else { return target }
         Logger.player.info("Seek to \(String(format: "%.3f", target.seconds)) s lands on the keyframe at \(String(format: "%.3f", Double(landing) / 1e7)) s")
@@ -187,44 +286,38 @@ public final class EnhancedPlayer {
 
     // MARK: Tracks
 
-    /// Selects the audio track at `index`, counting the file's audio tracks from 0.
-    public func selectAudioTrack(index: Int) {
-        if let session, !session.audioTrackNames.indices.contains(index) {
-            Logger.player.warning("Audio track \(index) does not exist (\(session.audioTrackNames.count) tracks)")
+    private func selectAudio(_ track: MediaTrack?) {
+        guard let track else {
+            Logger.player.warning("Audio can't be turned off; keeping the current track")
             return
         }
+        guard audioTracks.contains(track) else {
+            Logger.player.warning("Audio track \(track.index) (\(track.name)) is not one of the loaded media's tracks")
+            return
+        }
+        audioSelection = track
         guard isReady, let item, let session else {
-            startSelection.audio = index
-            selectedAudioTrackIndex = index
+            startSelection.audio = track.index
+            session?.setStartSelection(startSelection)
             return
         }
-        let name = session.audioTrackNames[index]
+        let name = session.audioTrackNames[track.index]
         Task { await self.select(named: name, characteristic: .audible, in: item) }
     }
 
-    /// Selects the subtitle track at `index`: external subtitles first, then the file's own.
-    public func selectSubtitleTrack(index: Int) {
-        if let session, !session.subtitleTrackNames.indices.contains(index) {
-            Logger.player.warning("Subtitle track \(index) does not exist (\(session.subtitleTrackNames.count) tracks)")
+    private func selectSubtitle(_ track: MediaTrack?) {
+        if let track, !subtitleTracks.contains(track) {
+            Logger.player.warning("Subtitle track \(track.index) (\(track.name)) is not one of the loaded media's tracks")
             return
         }
+        subtitleSelection = track
         guard isReady, let item, let session else {
-            startSelection.subtitle = .track(index)
-            selectedSubtitleTrackIndex = index
+            startSelection.subtitle = track.map { .track($0.index) } ?? .off
+            session?.setStartSelection(startSelection)
             return
         }
-        let name = session.subtitleTrackNames[index]
+        let name = track.map { session.subtitleTrackNames[$0.index] }
         Task { await self.select(named: name, characteristic: .legible, in: item) }
-    }
-
-    /// Turns subtitles off. A forced track for the audio's language still shows.
-    public func turnOffSubtitles() {
-        guard isReady, let item else {
-            startSelection.subtitle = .off
-            selectedSubtitleTrackIndex = nil
-            return
-        }
-        Task { await self.select(named: nil, characteristic: .legible, in: item) }
     }
 
     private func select(named name: String?, characteristic: AVMediaCharacteristic, in item: AVPlayerItem) async {
@@ -239,13 +332,6 @@ public final class EnhancedPlayer {
     }
 
     // MARK: Presentation
-
-    /// What the view shows around the playback, applied to every item. Only what changed is rewritten.
-    func setPresentation(metadata: PlayerMetadata?, chapters: [Chapter]?) {
-        self.metadata = metadata
-        customChapters = chapters
-        if let item { applyPresentation(to: item) }
-    }
 
     private struct MetadataState: Equatable {
         var metadata: PlayerMetadata?
@@ -263,6 +349,7 @@ public final class EnhancedPlayer {
     }
 
     private func applyMetadata(to item: AVPlayerItem) {
+        let metadata = currentMedia?.metadata
         let artwork = metadata?.artwork
         if let artwork { loadArtwork(artwork) }
         let data = artwork.flatMap(artworkData)
@@ -275,7 +362,6 @@ public final class EnhancedPlayer {
     private func applyChapters(to item: AVPlayerItem) {
         #if os(tvOS)
         guard let session else { return }
-        let chapters = customChapters ?? fileChapters
         let artworks = Set(chapters.compactMap(\.artwork))
         artworks.forEach(loadArtwork)
         // Titles go up at once; images together once they have all arrived, not one by one.
@@ -303,7 +389,7 @@ public final class EnhancedPlayer {
     /// Downloads an image once for the player's lifetime, then applies whatever is waiting on it.
     private func loadArtwork(_ artwork: Artwork) {
         guard case .url(let url) = artwork, artworkCache[artwork] == nil, artworkLoads[artwork] == nil, !failedArtwork.contains(artwork) else { return }
-        let headers = configuration.httpHeaders
+        let headers = configuration.httpHeaders.merging(currentMedia?.headers ?? [:]) { _, media in media }
         artworkLoads[artwork] = Task { [weak self] in
             var request = URLRequest(url: url, timeoutInterval: 15)
             for (field, value) in headers { request.setValue(value, forHTTPHeaderField: field) }
@@ -329,14 +415,14 @@ public final class EnhancedPlayer {
 
     // MARK: View
 
-    /// The view appeared: show the player there and start a session unless one is running.
+    /// The view appeared: show the player there and start a session for the loaded media unless one is running.
     func attach(_ host: PlayerHostViewController) {
         let previous = self.host
         if let previous, previous !== host { previous.playerViewController.player = nil }
         self.host = host
         host.playerViewController.player = avPlayer
         if previous !== host, let session, let item { installRenderers(session: session, item: item, recreate: true) }
-        guard session == nil, startTask == nil else { return }
+        guard session == nil, startTask == nil, currentMedia != nil else { return }
         start()
     }
 
@@ -359,12 +445,16 @@ public final class EnhancedPlayer {
     // MARK: Session
 
     private func start() {
+        guard let media = currentMedia else { return }
         status = .loading
         error = nil
-        Logger.player.info("Opening \(url.lastPathComponent)")
-        startTask = Task { [weak self, url, configuration, externalSubtitles, trickplay] in
+        Logger.player.info("Opening \(media.url.lastPathComponent)")
+        var configuration = configuration
+        configuration.httpHeaders.merge(media.headers) { _, media in media }
+        let generation = loadGeneration
+        startTask = Task { [weak self, configuration] in
             do {
-                let session = try await EnhancedPlaybackSession.start(url: url, configuration: configuration, externalSubtitles: externalSubtitles, trickplay: trickplay)
+                let session = try await EnhancedPlaybackSession.start(url: media.url, configuration: configuration, externalSubtitles: media.subtitles, trickplay: media.trickplay)
                 guard let self, !Task.isCancelled else {
                     await session.stop()
                     return
@@ -381,25 +471,29 @@ public final class EnhancedPlayer {
                 Logger.player.error("Playback did not start: \(error)")
                 guard let self, !Task.isCancelled, !(error is CancellationError) else { return }
                 self.fail(error)
+                self.failWaiters(error) { $0 == generation }
             }
         }
     }
 
     private func sessionDidOpen(_ session: EnhancedPlaybackSession) {
-        duration = session.duration
-        fileChapters = session.fileChapters
-        subtitleTrackNames = session.subtitleTrackNames
-        if let audio = startSelection.audio, !session.audioTrackNames.indices.contains(audio) {
-            Logger.player.warning("Audio track \(audio) does not exist (\(session.audioTrackNames.count) tracks); starting with the default")
+        duration = .seconds(session.duration)
+        chapters = currentMedia?.chapters ?? session.fileChapters
+        audioTracks = session.audioTracks
+        subtitleTracks = session.subtitleTracks
+        // A selection kept from an earlier session of this media, by index.
+        if let audio = startSelection.audio, !session.audioTracks.indices.contains(audio) {
+            Logger.player.warning("Audio track \(audio) does not exist (\(session.audioTracks.count) tracks); starting with the default")
             startSelection.audio = nil
         }
-        if case .track(let subtitle) = startSelection.subtitle, !session.subtitleTrackNames.indices.contains(subtitle) {
-            Logger.player.warning("Subtitle track \(subtitle) does not exist (\(session.subtitleTrackNames.count) tracks); starting with the default")
+        if case .track(let subtitle) = startSelection.subtitle, !session.subtitleTracks.indices.contains(subtitle) {
+            Logger.player.warning("Subtitle track \(subtitle) does not exist (\(session.subtitleTracks.count) tracks); starting with the default")
             startSelection.subtitle = nil
         }
         session.setStartSelection(startSelection)
-        selectedAudioTrackIndex = session.defaultAudioIndex(startSelection)
-        selectedSubtitleTrackIndex = session.defaultSubtitleIndex(startSelection)
+        audioSelection = session.defaultAudioIndex(startSelection).map { session.audioTracks[$0] }
+        subtitleSelection = session.defaultSubtitleIndex(startSelection).map { session.subtitleTracks[$0] }
+        answerWaiters()
     }
 
     private func fail(_ error: any Error) {
@@ -411,7 +505,12 @@ public final class EnhancedPlayer {
     private func teardown() {
         startTask?.cancel()
         startTask = nil
-        if isReady, status != .ended, startPosition == nil { startPosition = currentTime }
+        if isReady, status != .ended, startPosition == nil { startPosition = currentTime.timeInterval }
+        // Showing the view again starts on the tracks playing now.
+        if isReady {
+            if let audio = audioSelection { startSelection.audio = audio.index }
+            startSelection.subtitle = subtitleSelection.map { .track($0.index) } ?? .off
+        }
         if status == .ended { startPosition = nil }
         isReady = false
         removeItemObservers()
@@ -548,25 +647,18 @@ public final class EnhancedPlayer {
 
     /// Puts the starting tracks and position in place, then plays if asked to.
     private func prepareStart(_ item: AVPlayerItem, session: EnhancedPlaybackSession) async {
-        // The master already marks the chosen tracks DEFAULT. Selecting them as well covers
-        // the system's language preference choosing another.
-        if let audio = startSelection.audio {
-            await select(named: session.audioTrackNames[audio], characteristic: .audible, in: item)
-        }
-        switch startSelection.subtitle {
-        case .track(let index):
-            await select(named: session.subtitleTrackNames[index], characteristic: .legible, in: item)
-        case .off:
-            await select(named: nil, characteristic: .legible, in: item)
-        case nil:
-            break
-        }
+        let applied = await applyStartSelection(to: item, session: session, after: nil)
         guard self.item === item else { return }
         if let startPosition, startPosition > 0 {
             let target = CMTime(seconds: max(0, startPosition - session.originSeconds), preferredTimescale: 600)
             _ = await avPlayer.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
             guard self.item === item else { return }
         }
+        // A track chosen while the others were applied, or during the seek, still counts as a
+        // starting track: until `isReady`, choices only go into `startSelection`.
+        // Nothing awaits between its return and `isReady`, so no choice falls in between.
+        _ = await applyStartSelection(to: item, session: session, after: applied)
+        guard self.item === item else { return }
         isReady = true
         // AVPlayer may have started on other tracks than the master's defaults.
         updateSelectedTracks(item, session: session)
@@ -577,6 +669,32 @@ public final class EnhancedPlayer {
         } else {
             status = .paused
         }
+    }
+
+    /// Selects the starting tracks, again for as long as they change while being selected.
+    /// Returns what was selected last. With `after`, only applies what differs from it.
+    private func applyStartSelection(to item: AVPlayerItem, session: EnhancedPlaybackSession, after previous: StartSelection?) async -> StartSelection {
+        var applied = previous
+        while applied != startSelection, self.item === item {
+            let selection = startSelection
+            // The master already marks the chosen tracks DEFAULT. Selecting them as well covers
+            // the system's language preference choosing another.
+            if let audio = selection.audio, audio != applied?.audio {
+                await select(named: session.audioTrackNames[audio], characteristic: .audible, in: item)
+            }
+            if selection.subtitle != applied?.subtitle {
+                switch selection.subtitle {
+                case .track(let index):
+                    await select(named: session.subtitleTrackNames[index], characteristic: .legible, in: item)
+                case .off:
+                    await select(named: nil, characteristic: .legible, in: item)
+                case nil:
+                    break
+                }
+            }
+            applied = selection
+        }
+        return applied ?? startSelection
     }
 
     private func installRenderers(session: EnhancedPlaybackSession, item: AVPlayerItem, recreate: Bool) {
@@ -674,7 +792,7 @@ public final class EnhancedPlayer {
         timeObserver = avPlayer.addPeriodicTimeObserver(forInterval: CMTime(value: 1, timescale: 2), queue: .main) { [weak self] time in
             MainActor.assumeIsolated {
                 guard let self, self.isReady, time.isNumeric else { return }
-                self.currentTime = time.seconds + session.originSeconds
+                self.currentTime = .seconds(time.seconds + session.originSeconds)
             }
         }
     }
@@ -736,10 +854,12 @@ public final class EnhancedPlayer {
                   self.item === item
             else { return }
             let selection = item.currentMediaSelection
-            if let name = selection.selectedMediaOption(in: audible)?.renditionName {
-                selectedAudioTrackIndex = session.audioTrackNames.firstIndex(of: name)
+            if let name = selection.selectedMediaOption(in: audible)?.renditionName, let index = session.audioTrackNames.firstIndex(of: name) {
+                audioSelection = session.audioTracks[index]
             }
-            selectedSubtitleTrackIndex = selection.selectedMediaOption(in: legible)?.renditionName.flatMap { session.subtitleTrackNames.firstIndex(of: $0) }
+            subtitleSelection = selection.selectedMediaOption(in: legible)?.renditionName
+                .flatMap { session.subtitleTrackNames.firstIndex(of: $0) }
+                .map { session.subtitleTracks[$0] }
         }
     }
 }
@@ -759,11 +879,12 @@ enum MetadataItems {
     }
 
     static func chapterMarkers(_ chapters: [Chapter], origin: TimeInterval, movieEnd: TimeInterval, artwork: (Artwork) -> Data?) -> [AVTimedMetadataGroup] {
-        chapters.resolvingEnds(movieEnd: movieEnd).map { chapter, end in
+        chapters.resolvingEnds(movieEnd: .seconds(movieEnd)).map { chapter, end in
             var items = [item(.commonIdentifierTitle, chapter.title as NSString)]
             if let data = chapter.artwork.flatMap(artwork) { items.append(artworkItem(data)) }
-            let start = CMTime(seconds: max(0, chapter.start - origin), preferredTimescale: 1000)
-            let duration = CMTime(seconds: end - max(chapter.start, origin), preferredTimescale: 1000)
+            let chapterStart = chapter.start.timeInterval
+            let start = CMTime(seconds: max(0, chapterStart - origin), preferredTimescale: 1000)
+            let duration = CMTime(seconds: end.timeInterval - max(chapterStart, origin), preferredTimescale: 1000)
             return AVTimedMetadataGroup(items: items, timeRange: CMTimeRange(start: start, duration: duration))
         }
     }

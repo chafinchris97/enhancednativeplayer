@@ -155,14 +155,14 @@ struct ExternalSubtitleTests {
 
     @Test func chapterEndsComeFromTheNextChapter() {
         let chapters = [
-            Chapter(title: "B", start: 100),
-            Chapter(title: "A", start: 0),
-            Chapter(title: "C", start: 200, end: 250),
+            Chapter(title: "B", start: .seconds(100)),
+            Chapter(title: "A", start: .zero),
+            Chapter(title: "C", start: .seconds(200), end: .seconds(250)),
         ]
-        let resolved = chapters.resolvingEnds(movieEnd: 300)
+        let resolved = chapters.resolvingEnds(movieEnd: .seconds(300))
         #expect(resolved.map(\.chapter.title) == ["A", "B", "C"])
-        #expect(resolved.map(\.end) == [100, 200, 250])
-        #expect([Chapter(title: "Last", start: 10)].resolvingEnds(movieEnd: 60).map(\.end) == [60])
+        #expect(resolved.map(\.end) == [.seconds(100), .seconds(200), .seconds(250)])
+        #expect([Chapter(title: "Last", start: .seconds(10))].resolvingEnds(movieEnd: .seconds(60)).map(\.end) == [.seconds(60)])
     }
 }
 
