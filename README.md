@@ -2,7 +2,7 @@
 
 # EnhancedNativePlayer
 
-A tvOS video engine that plays any remote MKV / MP4 through `AVPlayer` by losslessly remuxing it into HLS (fMP4) on the fly, served from a local [Hummingbird](https://github.com/hummingbird-project/hummingbird) server. Video `AVPlayer` can't decode (AV1, VC-1, MPEG-4 Part 2, …) is decoded by the engine and drawn under the same system controls. FFmpeg comes from [FFmpegBuild](https://github.com/superuser404notfound/FFmpegBuild), the slim build AetherEngine uses.
+A tvOS video engine that plays any remote MKV / MP4 through `AVPlayer` by losslessly remuxing it into HLS (fMP4) on the fly, served from a small HTTP/1.1 server of its own on Network.framework, bound to loopback. Video `AVPlayer` can't decode (AV1, VC-1, MPEG-4 Part 2, …) is decoded by the engine and drawn under the same system controls. FFmpeg comes from [FFmpegBuild](https://github.com/superuser404notfound/FFmpegBuild), the slim build AetherEngine uses.
 
 ```swift
 import EnhancedNativePlayer
@@ -50,7 +50,7 @@ Times are `Duration`s in the file's own timeline, which is also the clock a side
 
 `EnhancedPlayerConfiguration` sets the segment duration (`hls_time`, default 6), the look-ahead (default 3 segments), HTTP headers for every source (the media's own go over them), the cache directory and the source cache budget. The remuxer isn't usable on its own, because PGS and ASS drawing, forced-subtitle selection, display-mode matching and the SDR fallback all depend on the player.
 
-Requirements: tvOS 17 / iOS 17 / macOS 14 (Hummingbird 2), and a source server that answers range requests.
+Requirements: tvOS 17 / iOS 17 / macOS 14, and a source server that answers range requests.
 
 ## How it works
 

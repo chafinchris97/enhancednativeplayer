@@ -1,6 +1,5 @@
 import AetherLibavutil
 import Foundation
-import Hummingbird
 import Logging
 
 /// One playback of one remote file: probe, plan, local HLS server and the remux
@@ -459,7 +458,7 @@ final class PlaybackSessionCore: Sendable {
         )
     }
 
-    func respond(to fileName: String, runtimeTicks: Int64?) async throws -> Response {
+    func respond(to fileName: String, runtimeTicks: Int64?) async -> Response {
         guard let route = HLSRoute(fileName: fileName) else { return Response(status: .notFound) }
         let context = context
         switch route {

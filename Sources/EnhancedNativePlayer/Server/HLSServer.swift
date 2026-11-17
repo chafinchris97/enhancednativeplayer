@@ -1,9 +1,5 @@
 import Foundation
-import Hummingbird
 import Logging
-import NIOCore
-import NIOTransportServices
-import ServiceLifecycle
 #if canImport(UIKit) && !os(watchOS)
 import UIKit
 #endif
@@ -18,8 +14,7 @@ import UIKit
 final class HLSServer: Sendable {
     private struct Instance {
         let id: Int
-        let group: ServiceGroup
-        let task: Task<Void, Never>
+        let listener: HTTPListener
     }
 
     private struct State {
@@ -70,8 +65,7 @@ final class HLSServer: Sendable {
         }
         if let observer { NotificationCenter.default.removeObserver(observer) }
         guard let current else { return }
-        await current.group.triggerGracefulShutdown()
-        await current.task.value
+        await current.listener.shutdownAndWait()
     }
 
     /// Replaces the listener with a fresh one on the same port. With `replacing`, only
@@ -86,8 +80,8 @@ final class HLSServer: Sendable {
         }
         guard let claimed else { return }
         defer { state.withLock { $0.rebinding = false } }
-        if let old = claimed.old { await old.group.triggerGracefulShutdown() }
-        // The old listener may hold the port for a moment after its shutdown is triggered.
+        claimed.old?.listener.shutdown()
+        // The old listener may hold the port for a moment after it is cancelled.
         for attempt in 1...20 {
             do {
                 _ = try await launch(port: claimed.port)
@@ -110,59 +104,54 @@ final class HLSServer: Sendable {
             return state.launches
         }) else { throw EnhancedPlayerError.cancelled }
 
-        let router = Router()
         let session = session
-        let requestLogger = logger
-        router.get(":file") { request, context -> Response in
-            let file = try context.parameters.require("file")
-            let ticks = request.uri.queryParameters.get("runtimeTicks").flatMap { Int64($0) }
-            // One line when a request arrives and one when it is answered, so a stall shows
-            // which file the player is waiting on.
-            requestLogger.info("GET \(file)")
-            let started = ContinuousClock.now
-            let response = try await session.respond(to: file, runtimeTicks: ticks)
-            requestLogger.info("GET \(file) → \(response.status.code) in \((ContinuousClock.now - started).formatted(.units(allowed: [.milliseconds])))")
-            return response
-        }
-
-        let (ports, continuation) = AsyncStream<Int>.makeStream()
-        let app = Application(
-            router: router,
-            configuration: .init(address: .hostname("127.0.0.1", port: port), serverName: "EnhancedNativePlayer"),
-            onServerRunning: { channel in
-                continuation.yield(channel.localAddress?.port ?? 0)
-                continuation.finish()
-            },
-            // Hummingbird's .singleton only picks Network.framework on iOS, not tvOS.
-            eventLoopGroupProvider: .shared(NIOTSEventLoopGroup.singleton),
-            logger: logger
-        )
-        let group = ServiceGroup(configuration: .init(services: [app], logger: logger))
         let logger = logger
-        let task = Task { [weak self] in
-            do {
-                try await group.run()
-            } catch {
+        let listener = try HTTPListener(
+            port: port,
+            serverName: "EnhancedNativePlayer",
+            handler: { request in
+                // One path component, the file's name.
+                let components = request.path.split(separator: "/", omittingEmptySubsequences: false).dropFirst()
+                guard components.count == 1, let file = components.first.map(String.init), !file.isEmpty else {
+                    return Response(status: .notFound)
+                }
+                let ticks = request.query["runtimeTicks"].flatMap { Int64($0) }
+                // One line when a request arrives and one when it is answered, so a stall shows
+                // which file the player is waiting on.
+                logger.info("GET \(file)")
+                let started = ContinuousClock.now
+                let response = await session.respond(to: file, runtimeTicks: ticks)
+                logger.info("GET \(file) → \(response.status.code) in \((ContinuousClock.now - started).formatted(.units(allowed: [.milliseconds])))")
+                return response
+            },
+            onFailure: { [weak self] error in
                 logger.error("HLS server stopped: \(error)")
+                // A listener that closes on its own was taken away; bring it back.
+                Task { await self?.rebind(replacing: id) }
             }
-            continuation.finish()
-            // A listener that closes on its own was taken away; bring it back.
-            await self?.rebind(replacing: id)
-        }
+        )
         let installed = state.withLock { state in
             guard !state.stopped else { return false }
-            state.current = Instance(id: id, group: group, task: task)
+            state.current = Instance(id: id, listener: listener)
             return true
         }
         guard installed else {
-            await group.triggerGracefulShutdown()
+            listener.shutdown()
             throw EnhancedPlayerError.cancelled
         }
-        for await bound in ports where bound > 0 {
+        do {
+            let bound = try await listener.start()
             state.withLock { $0.port = bound }
             return bound
+        } catch {
+            listener.shutdown()
+            state.withLock { state in
+                if state.current?.id == id { state.current = nil }
+            }
+            if case EnhancedPlayerError.cancelled = error { throw error }
+            logger.error("HLS server did not start on port \(port): \(error)")
+            throw EnhancedPlayerError.serverFailedToStart
         }
-        throw EnhancedPlayerError.serverFailedToStart
     }
 }
 
@@ -257,51 +246,5 @@ private extension String {
 
     func dropPrefix(_ prefix: String) -> String? {
         hasPrefix(prefix) ? String(dropFirst(prefix.count)) : nil
-    }
-}
-
-extension Response {
-    static func playlist(_ text: String) -> Response {
-        Response(
-            status: .ok,
-            headers: [.contentType: "application/vnd.apple.mpegurl", .cacheControl: "no-cache"],
-            body: ResponseBody(byteBuffer: ByteBuffer(string: text))
-        )
-    }
-
-    static func webVTT(_ text: String) -> Response {
-        Response(
-            status: .ok,
-            headers: [.contentType: "text/vtt"],
-            body: ResponseBody(byteBuffer: ByteBuffer(string: text))
-        )
-    }
-
-    static func mp4(_ data: Data, audio: Bool) -> Response {
-        Response(
-            status: .ok,
-            headers: [.contentType: audio ? "audio/mp4" : "video/mp4"],
-            body: ResponseBody(byteBuffer: ByteBuffer(bytes: data))
-        )
-    }
-
-    /// Streams a segment file, then reports whether it reached the client.
-    static func segment(_ url: URL, audio: Bool, completion: @escaping @Sendable (Bool) -> Void) throws -> Response {
-        let handle = try FileHandle(forReadingFrom: url)
-        let size = Int(try handle.seekToEnd())
-        try handle.seek(toOffset: 0)
-        let body = ResponseBody(contentLength: size) { writer in
-            var delivered = false
-            defer {
-                try? handle.close()
-                completion(delivered)
-            }
-            while let chunk = try handle.read(upToCount: 1 << 20), !chunk.isEmpty {
-                try await writer.write(ByteBuffer(bytes: chunk))
-            }
-            try await writer.finish(nil)
-            delivered = true
-        }
-        return Response(status: .ok, headers: [.contentType: audio ? "audio/mp4" : "video/mp4"], body: body)
     }
 }
