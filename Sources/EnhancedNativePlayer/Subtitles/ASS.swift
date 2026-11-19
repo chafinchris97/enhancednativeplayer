@@ -3,7 +3,7 @@ import EPLibavformat
 import EPLibavutil
 import CoreGraphics
 import Foundation
-import Libass
+import EPLibass
 
 /// One ASS event as Matroska stores it: the timing lives in the block, the rest is the
 /// event line without its `Start` and `End` fields, which is what `ass_process_chunk` takes.

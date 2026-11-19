@@ -1,6 +1,6 @@
 import CoreGraphics
 import Foundation
-import Libass
+import EPLibass
 import Testing
 @testable import EnhancedNativePlayer
 

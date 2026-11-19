@@ -1,5 +1,5 @@
 #!/bin/sh
-# Builds Frameworks/Libass.xcframework: libass with its optimised assembly (NEON on arm64,
+# Builds Frameworks/EPLibass.xcframework: libass with its optimised assembly (NEON on arm64,
 # AVX2/SSE on x86_64), and the FreeType, FriBidi and HarfBuzz it needs, merged into one
 # static library per platform. Fonts come from attached files and CoreText; no fontconfig.
 #
@@ -18,7 +18,7 @@ MACOS_MIN=14.0
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK=${1:-${TMPDIR:-/tmp}/enp-libass-build}
-OUT="$ROOT/Frameworks/Libass.xcframework"
+OUT="$ROOT/Frameworks/EPLibass.xcframework"
 JOBS=$(sysctl -n hw.ncpu)
 mkdir -p "$WORK/src"
 
@@ -113,13 +113,13 @@ mkdir -p "$WORK/fat/ios" "$WORK/fat/tvos"
 cp "$WORK/ios-arm64/libass-merged.a" "$WORK/fat/ios/libass.a"
 cp "$WORK/tvos-arm64/libass-merged.a" "$WORK/fat/tvos/libass.a"
 
-# Only libass's own headers are public; the module is `Libass`.
+# Only libass's own headers are public; the module is `EPLibass`.
 headers="$WORK/headers"
 rm -rf "$headers"
 mkdir -p "$headers/ass"
 cp "$WORK/ios-arm64/prefix/include/ass/ass.h" "$WORK/ios-arm64/prefix/include/ass/ass_types.h" "$headers/ass/"
 cat >"$headers/module.modulemap" <<EOF
-module Libass {
+module EPLibass {
     header "ass/ass.h"
     link "c++"
     link "iconv"
