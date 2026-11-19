@@ -1,7 +1,10 @@
 #!/bin/sh
 # Builds Frameworks/EPLibass.xcframework: libass with its optimised assembly (NEON on arm64,
-# AVX2/SSE on x86_64), and the FreeType, FriBidi and HarfBuzz it needs, merged into one
-# static library per platform. Fonts come from attached files and CoreText; no fontconfig.
+# AVX2/SSE on x86_64), and the FreeType, FriBidi and HarfBuzz it needs, linked into one dynamic
+# framework that exports only libass. Fonts come from attached files and CoreText; no fontconfig.
+#
+# Dynamic, because FriBidi is LGPL: an app that links this keeps the right to ship closed source
+# as long as the framework stays replaceable, and this script rebuilds it from source.
 #
 #     scripts/build-libass.sh [work directory]
 #
@@ -88,6 +91,13 @@ EOF
 	# The assembly must be in, or this is the slow build all over again.
 	nm "$WORK/$slice/libass-merged.a" 2>/dev/null | grep -qE "_ass_blur4_horz16_(neon|sse2|avx2)" \
 		|| { echo "libass for $slice was built without its assembly" >&2; exit 1; }
+
+	# One dylib with all four libraries in it, exporting only libass's API.
+	"$cxx" $flags -dynamiclib -o "$WORK/$slice/EPLibass" -Wl,-all_load "$WORK/$slice/libass-merged.a" \
+		-install_name @rpath/EPLibass.framework/EPLibass "-Wl,-exported_symbol,_ass_*" \
+		-Wl,-headerpad_max_install_names -compatibility_version 1 -current_version "$LIBASS" \
+		-liconv -framework CoreText -framework CoreGraphics -framework CoreFoundation \
+		|| { echo "linking EPLibass failed for $slice" >&2; exit 1; }
 	echo "built $slice"
 }
 
@@ -100,43 +110,74 @@ build_slice tvos-sim-x86_64 appletvsimulator x86_64 "x86_64-apple-tvos$TVOS_MIN-
 build_slice macos-arm64 macosx arm64 "arm64-apple-macos$MACOS_MIN"
 build_slice macos-x86_64 macosx x86_64 "x86_64-apple-macos$MACOS_MIN"
 
-fat() {
-	name=$1; shift
-	mkdir -p "$WORK/fat/$name"
-	lipo -create "$@" -output "$WORK/fat/$name/libass.a"
-}
-rm -rf "$WORK/fat"
-fat ios-sim "$WORK/ios-sim-arm64/libass-merged.a" "$WORK/ios-sim-x86_64/libass-merged.a"
-fat tvos-sim "$WORK/tvos-sim-arm64/libass-merged.a" "$WORK/tvos-sim-x86_64/libass-merged.a"
-fat macos "$WORK/macos-arm64/libass-merged.a" "$WORK/macos-x86_64/libass-merged.a"
-mkdir -p "$WORK/fat/ios" "$WORK/fat/tvos"
-cp "$WORK/ios-arm64/libass-merged.a" "$WORK/fat/ios/libass.a"
-cp "$WORK/tvos-arm64/libass-merged.a" "$WORK/fat/tvos/libass.a"
+# make_framework <platform> <min OS> <slices...>: the slices' dylibs combined into
+# $WORK/frameworks/<platform>/EPLibass.framework. Only libass's own headers are public.
+make_framework() {
+	platform=$1 min=$2; shift 2
+	fw="$WORK/frameworks/$platform/EPLibass.framework"
+	rm -rf "$fw"
+	case $platform in
+	macos) contents="$fw/Versions/A"; resources="$contents/Resources" ;;
+	*) contents="$fw"; resources="$fw" ;;
+	esac
+	mkdir -p "$contents/Headers" "$contents/Modules" "$resources"
 
-# Only libass's own headers are public; the module is `EPLibass`.
-headers="$WORK/headers"
-rm -rf "$headers"
-mkdir -p "$headers/ass"
-cp "$WORK/ios-arm64/prefix/include/ass/ass.h" "$WORK/ios-arm64/prefix/include/ass/ass_types.h" "$headers/ass/"
-cat >"$headers/module.modulemap" <<EOF
-module EPLibass {
-    header "ass/ass.h"
-    link "c++"
-    link "iconv"
+	inputs=""
+	for slice in "$@"; do inputs="$inputs $WORK/$slice/EPLibass"; done
+	lipo -create $inputs -output "$contents/EPLibass"
+	strip -x "$contents/EPLibass"
+	cp "$WORK/$1/prefix/include/ass/ass.h" "$WORK/$1/prefix/include/ass/ass_types.h" "$contents/Headers/"
+	cat >"$contents/Modules/module.modulemap" <<EOF
+framework module EPLibass {
+    header "ass.h"
     export *
 }
 EOF
 
-for platform in ios ios-sim tvos tvos-sim macos; do
-	strip -S -x "$WORK/fat/$platform/libass.a" 2>/dev/null || true
-done
+	case $platform in
+	ios) supported=iPhoneOS ;; ios-sim) supported=iPhoneSimulator ;;
+	tvos) supported=AppleTVOS ;; tvos-sim) supported=AppleTVSimulator ;; macos) supported=MacOSX ;;
+	esac
+	case $platform in
+	macos) minkey=LSMinimumSystemVersion ;;
+	*) minkey=MinimumOSVersion ;;
+	esac
+	cat >"$resources/Info.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key><string>en</string>
+	<key>CFBundleExecutable</key><string>EPLibass</string>
+	<key>CFBundleIdentifier</key><string>io.github.libass.EPLibass</string>
+	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+	<key>CFBundleName</key><string>EPLibass</string>
+	<key>CFBundlePackageType</key><string>FMWK</string>
+	<key>CFBundleShortVersionString</key><string>$LIBASS</string>
+	<key>CFBundleVersion</key><string>$LIBASS</string>
+	<key>CFBundleSupportedPlatforms</key><array><string>$supported</string></array>
+	<key>$minkey</key><string>$min</string>
+</dict>
+</plist>
+EOF
+	if [ "$platform" = macos ]; then
+		ln -s A "$fw/Versions/Current"
+		for item in EPLibass Headers Modules Resources; do ln -s "Versions/Current/$item" "$fw/$item"; done
+	fi
+}
+
+rm -rf "$WORK/frameworks"
+make_framework ios $IOS_MIN ios-arm64
+make_framework ios-sim $IOS_MIN ios-sim-arm64 ios-sim-x86_64
+make_framework tvos $TVOS_MIN tvos-arm64
+make_framework tvos-sim $TVOS_MIN tvos-sim-arm64 tvos-sim-x86_64
+make_framework macos $MACOS_MIN macos-arm64 macos-x86_64
+
 rm -rf "$OUT"
 mkdir -p "$(dirname "$OUT")"
-xcodebuild -create-xcframework \
-	-library "$WORK/fat/ios/libass.a" -headers "$headers" \
-	-library "$WORK/fat/ios-sim/libass.a" -headers "$headers" \
-	-library "$WORK/fat/tvos/libass.a" -headers "$headers" \
-	-library "$WORK/fat/tvos-sim/libass.a" -headers "$headers" \
-	-library "$WORK/fat/macos/libass.a" -headers "$headers" \
-	-output "$OUT" >/dev/null
+args=""
+for platform in ios ios-sim tvos tvos-sim macos; do
+	args="$args -framework $WORK/frameworks/$platform/EPLibass.framework"
+done
+xcodebuild -create-xcframework $args -output "$OUT" >/dev/null
 echo "wrote $OUT (libass $LIBASS, FreeType $FREETYPE, FriBidi $FRIBIDI, HarfBuzz $HARFBUZZ)"

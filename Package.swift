@@ -3,34 +3,27 @@
 import Foundation
 import PackageDescription
 
-// The prebuilt libraries. scripts/build-ffmpeg.sh and scripts/build-libass.sh build them into
+// The prebuilt frameworks. scripts/build-ffmpeg.sh and scripts/build-libass.sh build them into
 // Frameworks/, and when they are there the package uses them. Otherwise they come from the
-// releases below, which scripts/release-binaries.sh uploads and writes in here.
-// FFMPEG_RELEASE_BEGIN
-let ffmpegRelease = "https://github.com/chafinchris97/enhancednativeplayer/releases/download/ffmpeg-8.1.3-1"
-let ffmpegChecksums = [
-    "EPLibavutil": "4ab85f53e7e17a13d57fbeafa580117e2e6bbcb40b22e4c56c6cffa1d2acb0fc",
-    "EPLibswresample": "f8ab35070997739f4a8ee203d8cdf7274e31c0aabb23d1ec5fa304fecf1b92db",
-    "EPLibavcodec": "ec805c6f626ac27471fac4e8c63ce26abf7f5e37a4afbd46657f0ebcb94ddfe7",
-    "EPLibavformat": "45d61808ebfe1c6b83239c0923ba5b56bdf09fa20db0ff073b1a6657386d3919",
+// package release below, which scripts/release.sh uploads and writes in here.
+// BINARIES_RELEASE_BEGIN
+let binariesRelease = "https://github.com/chafinchris97/enhancednativeplayer/releases/download/0.1.0"
+let binaryChecksums = [
+    "EPLibavutil": "54205b23cd466706d061b255b600660a196bcc61c3d72515389364eb5b24ca74",
+    "EPLibswresample": "1342aab8de28607b0fb5f159168a89635ee73c15f1c97d914a369302ace7064b",
+    "EPLibavcodec": "19cec4b6f697b9c532cfd5994ad82804b5b674929b595de9df04019cfe3b7cde",
+    "EPLibavformat": "f36413aad9269640886619b5b6c1c7d27b88670b51465061525d5120fc45b419",
+    "EPLibass": "306aaad56b7f2c544205a49f5728ff068a546b24e372bb7e7ec1f9cda11e6c3c",
 ]
-// FFMPEG_RELEASE_END
-// LIBASS_RELEASE_BEGIN
-let libassRelease = "https://github.com/chafinchris97/enhancednativeplayer/releases/download/libass-0.17.5-1"
-let libassChecksums = [
-    "EPLibass": "6b1cd08aea077e2b55d1375da17bff2fa7ad5278e8ab56131ef3f5f9f51f5634",
-]
-// LIBASS_RELEASE_END
+// BINARIES_RELEASE_END
 
-func binary(_ name: String, release: String, checksums: [String: String]) -> Target {
+func binary(_ name: String) -> Target {
     let local = "Frameworks/\(name).xcframework"
     if FileManager.default.fileExists(atPath: "\(Context.packageDirectory)/\(local)") {
         return .binaryTarget(name: name, path: local)
     }
-    return .binaryTarget(name: name, url: "\(release)/\(name).xcframework.zip", checksum: checksums[name]!)
+    return .binaryTarget(name: name, url: "\(binariesRelease)/\(name).xcframework.zip", checksum: binaryChecksums[name]!)
 }
-
-func ffmpeg(_ name: String) -> Target { binary(name, release: ffmpegRelease, checksums: ffmpegChecksums) }
 
 let package = Package(
     name: "EnhancedNativePlayer",
@@ -57,18 +50,16 @@ let package = Package(
                 .product(name: "Logging", package: "swift-log"),
                 "EPLibass",
                 "PixelInterleave",
-            ],
-            // libass finds system fonts through CoreText; HarfBuzz is C++.
-            linkerSettings: [.linkedFramework("CoreText"), .linkedLibrary("c++"), .linkedLibrary("iconv")]
+            ]
         ),
-        // libass with its assembly, and the FreeType, FriBidi and HarfBuzz it needs, in one
-        // static library per platform.
-        binary("EPLibass", release: libassRelease, checksums: libassChecksums),
+        // libass with its assembly, and the FreeType, FriBidi and HarfBuzz it needs, as one
+        // dynamic framework (FriBidi is LGPL).
+        binary("EPLibass"),
         // FFmpeg, with dav1d inside libavcodec, as dynamic frameworks (it is LGPL).
-        ffmpeg("EPLibavformat"),
-        ffmpeg("EPLibavcodec"),
-        ffmpeg("EPLibavutil"),
-        ffmpeg("EPLibswresample"),
+        binary("EPLibavformat"),
+        binary("EPLibavcodec"),
+        binary("EPLibavutil"),
+        binary("EPLibswresample"),
         // Plane interleaving for decoded video frames, in C with NEON so it is fast in a debug build too.
         .target(name: "PixelInterleave"),
         .testTarget(
