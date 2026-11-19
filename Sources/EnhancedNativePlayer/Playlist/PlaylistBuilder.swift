@@ -259,9 +259,9 @@ struct PlaylistBuilder: Sendable {
     }
 
     func codecLabel(_ track: AudioTrack) -> String {
+        // A FLAC transcode is lossless, so the label names the source codec.
         if track.delivery == .flac {
-            let source = track.profileName ?? track.codecName.uppercased()
-            return "FLAC (\(source))"
+            return track.profileName ?? track.codecName.uppercased()
         }
         switch track.codecName {
         case "aac": return "AAC"

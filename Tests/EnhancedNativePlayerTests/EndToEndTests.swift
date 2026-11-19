@@ -88,7 +88,7 @@ struct EndToEndTests {
                 // Same timing always. Same bytes too, except PCM decoded from a lossy codec:
                 // its decoder state (Opus energy prediction, ...) never converges bit-exactly
                 // after a seek, so the FLAC payload may differ in the last bits.
-                let lossySource = ["OPUS", "MP3", "VORBIS", "DTS)"].contains { session.audioTrackNames[track].contains("FLAC (\($0)") }
+                let lossySource = ["OPUS", "MP3", "VORBIS", "DTS"].contains { session.audioTrackNames[track].hasSuffix(" - \($0)") }
                 var timing = Self.timing(audioAgain), expected = Self.timing(audioSegments[track][i])
                 if lossySource, i == segmentCount - 1 {
                     // The track's final short block may differ by a few samples: codec delays
