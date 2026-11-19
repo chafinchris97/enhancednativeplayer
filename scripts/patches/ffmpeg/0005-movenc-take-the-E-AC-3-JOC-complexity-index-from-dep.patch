@@ -1,0 +1,36 @@
+Subject: [PATCH] movenc: take the E-AC-3 JOC complexity index from dependent
+ substreams too
+
+In the Blu-ray layout of Dolby Digital Plus with Atmos the JOC extension
+can sit in a dependent substream. The dec3 box took the complexity index
+from the independent substream only, and every later frame overwrote it,
+so the box lost it and the track played as its channel bed.
+---
+ libavformat/movenc.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/libavformat/movenc.c b/libavformat/movenc.c
+index f306424..8f411de 100644
+--- a/libavformat/movenc.c
++++ b/libavformat/movenc.c
+@@ -491,7 +491,10 @@ static int handle_eac3(MOVMuxContext *mov, AVPacket *pkt, MOVTrack *track)
+     info->data_rate = FFMAX(info->data_rate, hdr->bit_rate / 1000);
+     info->ac3_bit_rate_code = FFMAX(info->ac3_bit_rate_code,
+                                     hdr->ac3_bit_rate_code);
+-    info->complexity_index_type_a = hdr->complexity_index_type_a;
++    /* The Atmos (JOC) complexity index may sit in the independent substream
++     * or in a dependent one, so a frame without it does not clear it. */
++    if (hdr->complexity_index_type_a)
++        info->complexity_index_type_a = hdr->complexity_index_type_a;
+ 
+     num_blocks = hdr->num_blocks;
+ 
+@@ -559,6 +562,8 @@ static int handle_eac3(MOVMuxContext *mov, AVPacket *pkt, MOVTrack *track)
+                     goto end;
+                 }
+                 info->substream[parent].num_dep_sub++;
++                if (hdr->complexity_index_type_a)
++                    info->complexity_index_type_a = hdr->complexity_index_type_a;
+                 ret /= 8;
+ 
+                 /* get the dependent stream channel map, if exists */

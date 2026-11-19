@@ -1,6 +1,6 @@
-import AetherLibavcodec
-import AetherLibavformat
-import AetherLibavutil
+import EPLibavcodec
+import EPLibavformat
+import EPLibavutil
 import Foundation
 
 /// Reads stream layout and the full keyframe list without scanning packets.

@@ -1,6 +1,6 @@
-import AetherLibavcodec
-import AetherLibavformat
-import AetherLibavutil
+import EPLibavcodec
+import EPLibavformat
+import EPLibavutil
 
 // Swift does not import FFmpeg's function-like macros (FFERRTAG, AVERROR, ...),
 // so the handful the engine needs are spelled out here.

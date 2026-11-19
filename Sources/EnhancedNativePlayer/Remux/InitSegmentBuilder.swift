@@ -1,6 +1,6 @@
-import AetherLibavcodec
-import AetherLibavformat
-import AetherLibavutil
+import EPLibavcodec
+import EPLibavformat
+import EPLibavutil
 import Foundation
 
 /// Builds `init_video.mp4` and `audio_{n}_init.mp4` (ftyp + moov) on demand.

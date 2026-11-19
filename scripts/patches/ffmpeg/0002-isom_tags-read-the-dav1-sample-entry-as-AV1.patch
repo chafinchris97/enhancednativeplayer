@@ -1,0 +1,20 @@
+Subject: [PATCH] isom_tags: read the dav1 sample entry as AV1
+
+dav1 is the AV1 sample entry registered for Dolby Vision profile 10.
+Without the tag an MP4 carrying it probes as an unknown codec.
+---
+ libavformat/isom_tags.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/libavformat/isom_tags.c b/libavformat/isom_tags.c
+index 1cd655b..2740b5d 100644
+--- a/libavformat/isom_tags.c
++++ b/libavformat/isom_tags.c
+@@ -160,6 +160,7 @@ const AVCodecTag ff_codec_movvideo_tags[] = {
+     { AV_CODEC_ID_VP8,  MKTAG('v', 'p', '0', '8') }, /* VP8 */
+     { AV_CODEC_ID_VP9,  MKTAG('v', 'p', '0', '9') }, /* VP9 */
+     { AV_CODEC_ID_AV1,  MKTAG('a', 'v', '0', '1') }, /* AV1 */
++    { AV_CODEC_ID_AV1,  MKTAG('d', 'a', 'v', '1') }, /* AV1 for Dolby Vision profile 10 */
+ 
+     { AV_CODEC_ID_MPEG1VIDEO, MKTAG('m', '1', 'v', ' ') },
+     { AV_CODEC_ID_MPEG1VIDEO, MKTAG('m', '1', 'v', '1') }, /* Apple MPEG-1 Camcorder */

@@ -1,6 +1,6 @@
-import AetherLibavcodec
-import AetherLibavformat
-import AetherLibavutil
+import EPLibavcodec
+import EPLibavformat
+import EPLibavutil
 import Foundation
 
 /// Lossless video remux into `video_{n}.mp4` segments cut at the planned keyframes.

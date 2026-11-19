@@ -1,6 +1,6 @@
-import AetherLibavcodec
-import AetherLibavformat
-import AetherLibavutil
+import EPLibavcodec
+import EPLibavformat
+import EPLibavutil
 import Foundation
 
 private final class ByteSink {

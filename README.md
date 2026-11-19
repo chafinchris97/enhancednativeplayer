@@ -2,7 +2,7 @@
 
 # EnhancedNativePlayer
 
-A tvOS video engine that plays any remote MKV / MP4 through `AVPlayer` by losslessly remuxing it into HLS (fMP4) on the fly, served from a small HTTP/1.1 server of its own on Network.framework, bound to loopback. Video `AVPlayer` can't decode (AV1, VC-1, MPEG-4 Part 2, …) is decoded by the engine and drawn under the same system controls. FFmpeg comes from [FFmpegBuild](https://github.com/superuser404notfound/FFmpegBuild), the slim build AetherEngine uses.
+A tvOS video engine that plays any remote MKV / MP4 through `AVPlayer` by losslessly remuxing it into HLS (fMP4) on the fly, served from a small HTTP/1.1 server of its own on Network.framework, bound to loopback. Video `AVPlayer` can't decode (AV1, VC-1, MPEG-4 Part 2, …) is decoded by the engine and drawn under the same system controls. FFmpeg 8.1 is built by `scripts/build-ffmpeg.sh` with only what the engine uses, plus the small fixes in `scripts/patches/ffmpeg`, into dynamic frameworks under `Frameworks/` (dav1d inside libavcodec for AV1). The package uses those when they are there, and otherwise downloads the ones `scripts/release-ffmpeg.sh` published as a GitHub release.
 
 ```swift
 import EnhancedNativePlayer

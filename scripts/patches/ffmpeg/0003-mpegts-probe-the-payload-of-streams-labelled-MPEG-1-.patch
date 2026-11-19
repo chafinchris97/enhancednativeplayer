@@ -1,0 +1,26 @@
+Subject: [PATCH] mpegts: probe the payload of streams labelled MPEG-1 audio
+
+Some muxers label other audio, DTS among them, with stream type 0x03.
+Taken at its word, the stream opens as MP3 and never decodes. The payload
+is now probed, as it already is for 0x04 and AAC; a real MPEG audio stream
+settles on its first packet.
+---
+ libavformat/mpegts.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/libavformat/mpegts.c b/libavformat/mpegts.c
+index 8ba6998..69501d5 100644
+--- a/libavformat/mpegts.c
++++ b/libavformat/mpegts.c
+@@ -955,7 +955,10 @@ static int mpegts_set_stream_info(AVStream *st, PESContext *pes,
+     st->codecpar->codec_tag = pes->stream_type;
+ 
+     mpegts_find_stream_type(st, pes->stream_type, ISO_types);
+-    if (pes->stream_type == STREAM_TYPE_AUDIO_MPEG2 || pes->stream_type == STREAM_TYPE_AUDIO_AAC)
++    /* Some muxers label other audio (DTS among them) as MPEG-1 audio, so
++     * that label is confirmed by probing the payload like the two below. */
++    if (pes->stream_type == STREAM_TYPE_AUDIO_MPEG1 ||
++        pes->stream_type == STREAM_TYPE_AUDIO_MPEG2 || pes->stream_type == STREAM_TYPE_AUDIO_AAC)
+         sti->request_probe = 50;
+     if (pes->stream_type == STREAM_TYPE_PRIVATE_DATA)
+         sti->request_probe = AVPROBE_SCORE_STREAM_RETRY;

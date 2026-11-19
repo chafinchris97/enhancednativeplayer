@@ -11,8 +11,8 @@ import Foundation
 /// The pixels are unchanged, so PQ / HLG video looks washed out. Each packet is rewritten
 /// on its own, so restarted runs still produce byte-identical segments.
 ///
-/// FFmpeg's `hevc_metadata` and `filter_units` do the same, but the FFmpegBuild slim
-/// build has no such bitstream filters.
+/// FFmpeg's `hevc_metadata` and `filter_units` do the same, but our FFmpeg build
+/// has no bitstream filters.
 struct SDRBitstreamRewriter: Sendable {
     let codec: VideoCodec
     /// The source `hvcC` / `avcC` with the same rewrite applied.

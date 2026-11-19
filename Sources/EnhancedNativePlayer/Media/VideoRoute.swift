@@ -1,5 +1,5 @@
-import AetherLibavcodec
-import AetherLibavutil
+import EPLibavcodec
+import EPLibavutil
 
 /// Whether AVPlayer plays a file's video from fMP4 HLS itself, or the player decodes it and
 /// draws the frames (`RenderedVideoSource`).

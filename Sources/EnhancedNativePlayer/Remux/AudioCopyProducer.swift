@@ -1,6 +1,6 @@
-import AetherLibavcodec
-import AetherLibavformat
-import AetherLibavutil
+import EPLibavcodec
+import EPLibavformat
+import EPLibavutil
 import Foundation
 
 /// Opens a demuxer for one audio track, positioned so that segment `start` can be

@@ -1,7 +1,7 @@
-import AetherLibavcodec
-import AetherLibavformat
-import AetherLibavutil
-import AetherLibswresample
+import EPLibavcodec
+import EPLibavformat
+import EPLibavutil
+import EPLibswresample
 import Foundation
 
 /// Output format for a track that is transcoded to FLAC. Derived from the probe

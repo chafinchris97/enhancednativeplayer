@@ -3,3 +3,5 @@
 *.xcodeproj/xcuserdata/
 DerivedData/
 .DS_Store
+# Built by scripts/build-ffmpeg.sh; published as release assets, never committed.
+Frameworks/EPLib*.xcframework/
