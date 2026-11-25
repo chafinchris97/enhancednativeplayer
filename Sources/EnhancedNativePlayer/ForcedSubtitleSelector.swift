@@ -2,14 +2,14 @@
 import Logging
 
 /// Turns on the forced subtitle track for the selected audio's language. The renditions carry
-/// no FORCED attribute, since AVPlayer matches forced tracks on the audio's LANGUAGE and that
-/// holds a label here, so the selection is made by hand: once the item is ready to play, and
+/// no FORCED attribute, since AVPlayer matches forced tracks on the audio's LANGUAGE and the
+/// audio renditions carry none, so the selection is made by hand: once the item is ready to play, and
 /// when the audio changes after that, while subtitles are off or on a forced track. A track the
 /// user picked is left alone. Nothing is selected while the item loads: a selection change then
 /// can leave AVPlayer without its track list (no Dolby Vision profile, no video info) until a seek.
 ///
 /// AVPlayer's automatic selection criteria are on, but they don't override an explicit
-/// selection: it is AVPlayer's DEFAULT renditions at the start and whatever is selected here,
+/// selection: it is the player's starting tracks and whatever is selected here,
 /// through the API or by the user after that. A forced track leaves the caption display type alone.
 @MainActor
 final class ForcedSubtitleSelector {

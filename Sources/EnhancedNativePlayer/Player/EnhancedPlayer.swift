@@ -684,9 +684,11 @@ public final class EnhancedPlayer {
         var applied = previous
         while applied != startSelection, self.item === item {
             let selection = startSelection
-            // The master already marks the chosen tracks DEFAULT. Selecting them as well covers
-            // the system's language preference choosing another.
-            if let audio = selection.audio, audio != applied?.audio {
+            // No audio rendition is DEFAULT or AUTOSELECT, so AVPlayer starts on none: the
+            // audio is always selected here. The master marks the chosen subtitle track DEFAULT;
+            // selecting it as well covers the system's language preference choosing another.
+            let audio = session.defaultAudioIndex(selection)
+            if let audio, applied.map(session.defaultAudioIndex) != audio {
                 await select(named: session.audioTrackNames[audio], characteristic: .audible, in: item)
             }
             if selection.subtitle != applied?.subtitle {

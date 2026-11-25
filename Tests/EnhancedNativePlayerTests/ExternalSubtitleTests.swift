@@ -230,16 +230,24 @@ struct StartSelectionPlaylistTests {
             subtitle(1, language: "eng", isDefault: true),
             subtitle(2, language: "fre"),
         ]))
-        #expect(defaults(playlists.master(), type: "AUDIO") == ["\"English - AAC\""])
+        #expect(playlists.defaultAudioIndex() == 0)
         #expect(defaults(playlists.master(), type: "SUBTITLES") == ["\"English (2)\""])
 
         let chosen = StartSelection(audio: 1, subtitle: .track(2))
-        #expect(defaults(playlists.master(start: chosen), type: "AUDIO") == ["\"Japanese - AAC\""])
+        #expect(playlists.defaultAudioIndex(chosen) == 1)
         #expect(defaults(playlists.master(start: chosen), type: "SUBTITLES") == ["\"French\""])
         #expect(defaults(playlists.master(start: StartSelection(subtitle: .off)), type: "SUBTITLES").isEmpty)
         #expect(defaults(playlists.master(start: StartSelection(subtitle: .track(0))), type: "SUBTITLES") == ["\"English\""])
         // An index that doesn't exist falls back to the file's default.
         #expect(playlists.defaultAudioIndex(StartSelection(audio: 7)) == 0)
+    }
+
+    @Test func audioRenditionsCarryOnlyTheirLabel() {
+        let audio = builder(media(subtitles: [])).master().split(separator: "\n").filter { $0.contains("TYPE=AUDIO") }
+        #expect(audio.count == 2)
+        #expect(audio[0].contains("NAME=\"English - AAC\""))
+        // displayName is the NAME only without LANGUAGE, AUTOSELECT and DEFAULT.
+        #expect(!audio.contains { $0.contains("LANGUAGE=") || $0.contains("AUTOSELECT=") || $0.contains("DEFAULT=") })
     }
 
     @Test func externalTracksDontChangeTheFilesDefaultRule() {

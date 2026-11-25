@@ -194,7 +194,7 @@ final class EnhancedPlaybackSession: Sendable {
         core.startSelection.withLock { $0 = selection }
     }
 
-    /// The audio track playback starts with for `selection`.
+    /// The audio track playback starts with for `selection`, which the player selects itself.
     func defaultAudioIndex(_ selection: StartSelection) -> Int? {
         core.playlists.defaultAudioIndex(selection)
     }

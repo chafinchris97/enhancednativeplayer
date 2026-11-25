@@ -14,7 +14,7 @@ struct PlaylistBuilder: Sendable {
 
     // MARK: Master
 
-    /// The audio track the master marks DEFAULT: the one asked for, else the container's default, else the first.
+    /// The audio track the player starts on: the one asked for, else the container's default, else the first.
     func defaultAudioIndex(_ start: StartSelection = StartSelection()) -> Int? {
         if let audio = start.audio, media.audio.indices.contains(audio) { return audio }
         return media.audio.first(where: \.isDefault)?.index ?? media.audio.first?.index
@@ -53,19 +53,17 @@ struct PlaylistBuilder: Sendable {
     func master(sdr: Bool = false, start: StartSelection = StartSelection()) -> String {
         var lines = ["#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-INDEPENDENT-SEGMENTS", ""]
         let names = audioNames()
-        let defaultTrack = defaultAudioIndex(start)
         for track in media.audio {
-            // AVFoundation builds an option's displayName (what AVPlayerViewController's
-            // audio menu shows) from LANGUAGE and ignores NAME, so the label goes in both.
-            // It is not a BCP 47 tag; DEFAULT, not language preference, picks the track.
+            // AVFoundation's displayName (what AVPlayerViewController's audio menu shows) is the
+            // NAME only for a rendition with no LANGUAGE and neither AUTOSELECT nor DEFAULT.
+            // With either of those it is built from LANGUAGE alone, "Unknown" without one. With
+            // no AUTOSELECT or DEFAULT, AVPlayer starts on no audio, so the player selects it.
+            // Without LANGUAGE, AVPlayer offers subtitles generated from the audio as well.
             var attributes = [
                 "TYPE=AUDIO",
                 "GROUP-ID=\"\(Self.audioGroup)\"",
                 "NAME=\"\(names[track.index])\"",
-                "LANGUAGE=\"\(names[track.index])\"",
             ]
-            attributes.append("AUTOSELECT=YES")
-            attributes.append("DEFAULT=\(track.index == defaultTrack ? "YES" : "NO")")
             attributes.append("CHANNELS=\"\(track.isAtmos && track.delivery == .copy ? "16/JOC" : String(track.deliveredChannels))\"")
             attributes.append("URI=\"audio_\(track.index).m3u8\"")
             lines.append("#EXT-X-MEDIA:" + attributes.joined(separator: ","))
@@ -232,7 +230,7 @@ struct PlaylistBuilder: Sendable {
     /// so the menu and the system's language preference see the language. The menu labels an option
     /// from LANGUAGE alone, so forced tracks, later tracks of the same language, and a track with no
     /// known language carry their NAME instead to stay apart. No rendition is marked FORCED: AVPlayer
-    /// would only show one when the audio's LANGUAGE matched, and audio LANGUAGE is a label, not a tag.
+    /// would only show one when the audio's LANGUAGE matched, and the audio renditions carry none.
     func subtitleLanguages() -> [String] {
         let names = subtitleNames()
         var taken = Set<String>()
