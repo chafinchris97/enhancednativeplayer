@@ -8,8 +8,9 @@ import Logging
 /// user picked is left alone. Nothing is selected while the item loads: a selection change then
 /// can leave AVPlayer without its track list (no Dolby Vision profile, no video info) until a seek.
 ///
-/// The player keeps AVPlayer's automatic selection criteria off, so the selection is AVPlayer's
-/// DEFAULT renditions at the start and whatever is selected here or by the user after that.
+/// AVPlayer's automatic selection criteria are on, but they don't override an explicit
+/// selection: it is AVPlayer's DEFAULT renditions at the start and whatever is selected here,
+/// through the API or by the user after that. A forced track leaves the caption display type alone.
 @MainActor
 final class ForcedSubtitleSelector {
     private let session: EnhancedPlaybackSession

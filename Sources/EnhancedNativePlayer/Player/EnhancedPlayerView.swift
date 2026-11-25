@@ -1,10 +1,5 @@
 #if canImport(UIKit) && !os(watchOS)
-#if os(tvOS)
-import Accessibility
-#endif
 import AVKit
-import MediaAccessibility
-import Observation
 import SwiftUI
 import UIKit
 
@@ -60,14 +55,6 @@ private struct PlayerRepresentable: UIViewControllerRepresentable {
 final class PlayerHostViewController: UIViewController {
     let playerViewController = AVPlayerViewController()
     private var player: EnhancedPlayer
-    #if os(tvOS)
-    /// The track the subtitles menu's On turns back on, kept while subtitles are off.
-    private var lastSubtitleIndex: Int?
-    /// What was just picked in the subtitles menu (nil inside for off), shown until the
-    /// player's selection catches up, which comes after AVPlayer's notification.
-    private var chosenSubtitle: Int??
-    private var subtitlesMenu: SubtitlesMenu?
-    #endif
 
     init(player: EnhancedPlayer) {
         self.player = player
@@ -91,11 +78,6 @@ final class PlayerHostViewController: UIViewController {
         // The player sets the display criteria itself, and waits for the switch before playing.
         playerViewController.appliesPreferredDisplayCriteriaAutomatically = false
         playerViewController.delegate = self
-        // Once the user turns subtitles off in AVKit's own menu, its switch stays off whatever
-        // the player selects after, until the user turns it on there. Offering that menu no
-        // tracks takes it away, and the player's own menu in the transport bar takes its place.
-        playerViewController.allowedSubtitleOptionLanguages = []
-        updateSubtitlesMenu()
         #endif
     }
 
@@ -128,115 +110,6 @@ final class PlayerHostViewController: UIViewController {
 }
 
 #if os(tvOS)
-extension PlayerHostViewController {
-    /// The subtitles menu's items, built once per track list and changed in place after that:
-    /// AVKit redraws an open menu when an item it shows changes its state or subtitle, not
-    /// when the transport bar's items are replaced.
-    @MainActor
-    final class SubtitlesMenu {
-        let names: [String]
-        let on: UIAction
-        let off: UIAction
-        let languages: UIMenu
-        let tracks: [UIAction]
-        let menu: UIMenu
-        /// The track On turns on and Language shows: the selected one, or the last one while off.
-        var shown = 0
-
-        init(names: [String], choose: @escaping @MainActor (Int?) -> Void, style: UIMenu?) {
-            self.names = names
-            // On reads `shown` when it is chosen, so it is set after init.
-            var menuRef: SubtitlesMenu?
-            on = UIAction(title: "On", attributes: .keepsMenuPresented) { _ in choose(menuRef?.shown ?? 0) }
-            off = UIAction(title: "Off", attributes: .keepsMenuPresented) { _ in choose(nil) }
-            tracks = names.indices.map { index in UIAction(title: names[index]) { _ in choose(index) } }
-            languages = UIMenu(title: "Language", options: .singleSelection, children: tracks)
-            // No .singleSelection: with it the menu keeps its own checked item from the last tap,
-            // apart from the items' state, and a selection made elsewhere leaves two checked.
-            // Without it a pick closes the menu, which .keepsMenuPresented on On and Off prevents.
-            let toggle = UIMenu(options: .displayInline, children: [on, off])
-            menu = UIMenu(title: "Subtitles", image: UIImage(systemName: "captions.bubble"), children: [toggle, languages] + (style.map { [$0] } ?? []))
-            menuRef = self
-        }
-
-        /// Moves the checkmarks and the Language subtitle to `selected` (nil for off).
-        func show(_ selected: Int?, last: Int?) {
-            shown = selected ?? last.flatMap { names.indices.contains($0) ? $0 : nil } ?? 0
-            set(on, selected == nil ? .off : .on)
-            set(off, selected == nil ? .on : .off)
-            for (index, track) in tracks.enumerated() { set(track, index == shown ? .on : .off) }
-            if languages.subtitle != names[shown] { languages.subtitle = names[shown] }
-        }
-
-        private func set(_ action: UIAction, _ state: UIMenuElement.State) {
-            if action.state != state { action.state = state }
-        }
-    }
-
-    /// Puts the subtitles menu in the transport bar when the track list changes, and moves its
-    /// checkmarks whenever the selection changes.
-    private func updateSubtitlesMenu() {
-        let (names, playerSelection) = withObservationTracking {
-            (player.subtitleTracks.map(\.name), player.selectedSubtitleTrack?.index)
-        } onChange: { [weak self] in
-            Task { @MainActor [weak self] in self?.updateSubtitlesMenu() }
-        }
-        guard !names.isEmpty else {
-            subtitlesMenu = nil
-            playerViewController.transportBarCustomMenuItems = []
-            return
-        }
-        if subtitlesMenu?.names != names {
-            var style: UIMenu?
-            if #available(tvOS 26, *) { style = styleMenu() }
-            let menu = SubtitlesMenu(names: names, choose: { [weak self] index in self?.chooseSubtitle(index) }, style: style)
-            subtitlesMenu = menu
-            playerViewController.transportBarCustomMenuItems = [menu.menu]
-        }
-        if chosenSubtitle == .some(playerSelection) { chosenSubtitle = nil }
-        let selected = chosenSubtitle ?? playerSelection
-        if let selected { lastSubtitleIndex = selected }
-        subtitlesMenu?.show(selected, last: lastSubtitleIndex)
-    }
-
-    /// A pick in the subtitles menu: the menu shows it at once, before AVPlayer has applied it.
-    private func chooseSubtitle(_ index: Int?) {
-        chosenSubtitle = .some(index)
-        let tracks = player.subtitleTracks
-        player.selectedSubtitleTrack = index.flatMap { tracks.indices.contains($0) ? tracks[$0] : nil }
-        updateSubtitlesMenu()
-    }
-
-    /// The system's caption styles. Choosing one changes it for every app, as in AVKit's menu.
-    @available(tvOS 26, *)
-    private func styleMenu() -> UIMenu? {
-        guard let ids = MACaptionAppearanceCopyProfileIDs() as? [String], !ids.isEmpty else { return nil }
-        let active = MACaptionAppearanceCopyActiveProfileID() as String
-        let name = { (id: String) in MACaptionAppearanceCopyProfileName(id as CFString) as String }
-        var styles: [UIAction] = []
-        var menuRef: UIMenu?
-        for id in ids {
-            styles.append(UIAction(title: name(id), state: id == active ? .on : .off) { _ in
-                MACaptionAppearanceSetActiveProfileID(id as CFString)
-                // The active style isn't observed, so the checkmarks and subtitle move here.
-                for (styleID, style) in zip(ids, styles) { style.state = styleID == id ? .on : .off }
-                menuRef?.subtitle = name(id)
-            })
-        }
-        var children: [UIMenuElement] = [UIMenu(options: [.displayInline, .singleSelection], children: styles)]
-        if #available(tvOS 26.4, *), AccessibilitySettings.canOpenSettings(for: .captionStyles) {
-            // Below the styles, as in AVKit's menu: opens the caption styles in Settings.
-            let manage = UIAction(title: "Manage Styles", image: UIImage(systemName: "gear")) { _ in
-                Task { try? await AccessibilitySettings.openSettings(for: .captionStyles) }
-            }
-            children.append(UIMenu(options: .displayInline, children: [manage]))
-        }
-        let menu = UIMenu(title: "Style", subtitle: ids.contains(active) ? name(active) : nil, children: children)
-        menuRef = menu
-        return menu
-    }
-}
-
 extension PlayerHostViewController: @preconcurrency AVPlayerViewControllerDelegate {
     /// A scrub or skip in the system controls: the player may move it to a nearby keyframe.
     func playerViewController(_ playerViewController: AVPlayerViewController, timeToSeekAfterUserNavigatedFrom oldTime: CMTime, to targetTime: CMTime) -> CMTime {

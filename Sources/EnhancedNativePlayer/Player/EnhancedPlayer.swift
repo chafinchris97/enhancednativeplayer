@@ -2,6 +2,7 @@
 @preconcurrency import AVFoundation
 import AVKit
 import Logging
+import MediaAccessibility
 import Observation
 import UIKit
 
@@ -143,11 +144,8 @@ public final class EnhancedPlayer {
     /// - Parameter configuration: Engine tuning, the same for everything this player loads.
     public init(configuration: EnhancedPlayerConfiguration = EnhancedPlayerConfiguration()) {
         self.configuration = configuration
-        // Off for good: AVPlayer starts on the master's DEFAULT renditions and the player makes
-        // every other selection itself. Under the automatic criteria the system subtitle setting
-        // would decide what is drawn (with subtitles off, only FORCED renditions, which these
-        // are not) and AVPlayer would reselect the subtitles on every audio switch.
-        avPlayer.appliesMediaSelectionCriteriaAutomatically = false
+        // AVPlayer's automatic selection criteria stay on: with them off, AVKit's subtitles switch
+        // stays off once the user turns subtitles off in its menu, whatever is selected after.
     }
 
     deinit {
@@ -317,7 +315,16 @@ public final class EnhancedPlayer {
             return
         }
         let name = track.map { session.subtitleTrackNames[$0.index] }
-        Task { await self.select(named: name, characteristic: .legible, in: item) }
+        Task { await self.selectSubtitle(named: name, in: item) }
+    }
+
+    /// Sets the system caption display type the way the switch in AVKit's subtitles menu does
+    /// (always on for a track, forced only for off), then selects the rendition. The switch
+    /// follows the display type, so it then shows the selection. Like the switch, this changes
+    /// the user's setting for every app.
+    private func selectSubtitle(named name: String?, in item: AVPlayerItem) async {
+        MACaptionAppearanceSetDisplayType(.user, name == nil ? .forcedOnly : .alwaysOn)
+        await select(named: name, characteristic: .legible, in: item)
     }
 
     private func select(named name: String?, characteristic: AVMediaCharacteristic, in item: AVPlayerItem) async {
@@ -685,9 +692,9 @@ public final class EnhancedPlayer {
             if selection.subtitle != applied?.subtitle {
                 switch selection.subtitle {
                 case .track(let index):
-                    await select(named: session.subtitleTrackNames[index], characteristic: .legible, in: item)
+                    await selectSubtitle(named: session.subtitleTrackNames[index], in: item)
                 case .off:
-                    await select(named: nil, characteristic: .legible, in: item)
+                    await selectSubtitle(named: nil, in: item)
                 case nil:
                     break
                 }
