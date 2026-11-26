@@ -7,13 +7,13 @@ import PackageDescription
 // Frameworks/, and when they are there the package uses them. Otherwise they come from the
 // package release below, which scripts/release.sh uploads and writes in here.
 // BINARIES_RELEASE_BEGIN
-let binariesRelease = "https://github.com/chafinchris97/enhancednativeplayer/releases/download/0.1.0"
+let binariesRelease = "https://github.com/chafinchris97/enhancednativeplayer/releases/download/0.2.0"
 let binaryChecksums = [
-    "EPLibavutil": "54205b23cd466706d061b255b600660a196bcc61c3d72515389364eb5b24ca74",
-    "EPLibswresample": "1342aab8de28607b0fb5f159168a89635ee73c15f1c97d914a369302ace7064b",
-    "EPLibavcodec": "19cec4b6f697b9c532cfd5994ad82804b5b674929b595de9df04019cfe3b7cde",
-    "EPLibavformat": "f36413aad9269640886619b5b6c1c7d27b88670b51465061525d5120fc45b419",
-    "EPLibass": "306aaad56b7f2c544205a49f5728ff068a546b24e372bb7e7ec1f9cda11e6c3c",
+    "EPLibavutil": "80f2f7b4fd3a3da6501a4ed16a9568487e328dbf2ad098eca26fe751bcf48879",
+    "EPLibswresample": "64c905839d43e0f92f9f48080ec3a4060c7d1e6d27120a3411b741e6684b9f68",
+    "EPLibavcodec": "0174afc8008d534896cea74a419de3733eceadd208a57cb2e82b926378943414",
+    "EPLibavformat": "abfe235a35d5e73454ba1c079596617bb17c0526ff9798650edb60142942972e",
+    "EPLibass": "73aeb82cd26000e2497a76a1518d25940b670d99492a61894270598860e80249",
 ]
 // BINARIES_RELEASE_END
 
