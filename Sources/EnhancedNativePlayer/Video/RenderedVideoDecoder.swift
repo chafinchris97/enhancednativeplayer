@@ -86,7 +86,7 @@ final class RenderedVideoDecoder {
         let video = media.video
         guard let source = video.rendered else { throw EnhancedPlayerError.unsupportedVideoCodec("none") }
         codecName = source.codecName
-        demuxer = try Demuxer(file: file, token: token, findStreamInfo: false)
+        demuxer = try Demuxer(file: file, token: token, findStreamInfo: false, role: .playback)
         demuxer.discardAll(except: [video.streamIndex])
         streamIndex = video.streamIndex
         timeBase = video.timeBase

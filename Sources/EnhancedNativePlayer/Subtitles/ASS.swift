@@ -73,7 +73,7 @@ enum ASSFontReader {
     private static let fontExtensions: Set<String> = ["ttf", "otf", "ttc", "otc", "pfb", "pfa"]
 
     static func read(file: RemoteFile, token: CancellationToken) throws -> [ASSFont] {
-        let demuxer = try Demuxer(file: file, token: token, findStreamInfo: false)
+        let demuxer = try Demuxer(file: file, token: token, findStreamInfo: false, role: .subtitles)
         var fonts: [ASSFont] = []
         for index in 0..<demuxer.streamCount {
             let stream = demuxer.stream(index)

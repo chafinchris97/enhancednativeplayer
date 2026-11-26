@@ -15,7 +15,7 @@ struct VideoProducer: SegmentProducer {
         let video = rewriter == nil ? media.video : media.video.sdrVariant
         let usesDTS = media.keyframes.usesDecodeTimestamps
 
-        let demuxer = try Demuxer(file: context.file, token: run.token, findStreamInfo: false)
+        let demuxer = try Demuxer(file: context.file, token: run.token, findStreamInfo: false, role: .playback)
         let input = demuxer.stream(video.streamIndex)
         demuxer.discardAll(except: [video.streamIndex])
 

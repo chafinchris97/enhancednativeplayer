@@ -25,8 +25,8 @@ final class Demuxer {
     private var avio: UnsafeMutablePointer<AVIOContext>?
     private let cursor: Unmanaged<RemoteCursor>
 
-    init(file: RemoteFile, token: CancellationToken, findStreamInfo: Bool = true) throws {
-        cursor = Unmanaged.passRetained(RemoteCursor(file: file, token: token))
+    init(file: RemoteFile, token: CancellationToken, findStreamInfo: Bool = true, role: ReadRole = .lookup) throws {
+        cursor = Unmanaged.passRetained(RemoteCursor(file: file, token: token, role: role))
         let bufferSize: Int32 = 256 * 1024
         guard let buffer = av_malloc(Int(bufferSize))?.assumingMemoryBound(to: UInt8.self),
               let io = avio_alloc_context(buffer, bufferSize, 0, cursor.toOpaque(), remoteRead, nil, remoteSeek) else {

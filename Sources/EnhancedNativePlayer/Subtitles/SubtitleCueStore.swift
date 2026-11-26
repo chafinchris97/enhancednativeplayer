@@ -57,7 +57,7 @@ enum SubtitlePacketReader {
         // MP4 sample tables jump straight from one cue to the next. Matroska has to walk
         // the clusters, and a sparse track could have no next cue for most of the file,
         // so the video stays on there: its packets say when the segment has been passed.
-        let demuxer = try Demuxer(file: context.file, token: context.token, findStreamInfo: false)
+        let demuxer = try Demuxer(file: context.file, token: context.token, findStreamInfo: false, role: .subtitles)
         let walksFile = !context.media.keyframes.usesDecodeTimestamps
         demuxer.discardAll(except: walksFile ? [track.streamIndex, video.streamIndex] : [track.streamIndex])
         if segment > 0 {

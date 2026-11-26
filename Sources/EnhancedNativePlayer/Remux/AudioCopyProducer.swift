@@ -8,7 +8,7 @@ import Foundation
 /// straddling the boundary is read, and decoders are warmed up by the time they
 /// reach it. Anything before the boundary is dropped by the caller.
 func openAudioDemuxer(context: RemuxContext, track: AudioTrack, start: Int, token: CancellationToken) throws -> Demuxer {
-    let demuxer = try Demuxer(file: context.file, token: token, findStreamInfo: false)
+    let demuxer = try Demuxer(file: context.file, token: token, findStreamInfo: false, role: .playback)
     demuxer.discardAll(except: [track.streamIndex])
     if start > 0 {
         let video = context.media.video
