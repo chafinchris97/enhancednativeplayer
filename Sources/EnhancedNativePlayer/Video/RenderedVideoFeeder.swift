@@ -23,8 +23,11 @@ import Logging
 /// until `covers(_:)` says the frame at the target is queued. Until the clock arrives, the target
 /// stands in for it.
 final class RenderedVideoFeeder: @unchecked Sendable {
-    /// How far ahead of the clock frames are queued.
-    static let leadTicks: Int64 = 5_000_000
+    /// How far ahead of the clock frames are queued: enough to ride out a slow read of the source.
+    /// The renderer's `isReadyForMoreMediaData` goes false at about 280 ms, which a read that
+    /// waits on the network for a block eats whole, so it isn't waited for; `maxQueued` bounds
+    /// the memory instead.
+    static let leadTicks: Int64 = 10_000_000
     /// Memory the queued frames may take.
     static let queueBytes = 160 << 20
     /// A catch-up after a seek longer than this is logged: the image has been still that long.
@@ -206,16 +209,12 @@ final class RenderedVideoFeeder: @unchecked Sendable {
 
             let ahead = (queued.last?.end ?? clock) - clock
             let enough = atEnd || queued.count >= maxQueued || ahead >= Self.leadTicks
-            if enough || !renderer.isReadyForMoreMediaData {
+            if enough {
                 let waiting = ContinuousClock.now
                 condition.lock()
                 if !stopped, jump == nil { condition.wait(until: Date(timeIntervalSinceNow: 0.01)) }
                 condition.unlock()
-                if enough {
-                    stats.waitAhead += ContinuousClock.now - waiting
-                } else {
-                    stats.waitRenderer += ContinuousClock.now - waiting
-                }
+                stats.waitAhead += ContinuousClock.now - waiting
                 continue
             }
 
@@ -299,9 +298,9 @@ final class RenderedVideoFeeder: @unchecked Sendable {
 }
 
 /// What the video thread did over a window of playback, for the log: where its time went (reading
-/// packets, decoding, converting, enqueueing, and waiting, either with enough queued or on a
-/// renderer that takes no more), how far ahead of the clock frames reached the renderer, how many
-/// came after their start (and so showed late), and how many were dropped.
+/// packets, decoding, converting, enqueueing, and waiting with enough queued), how far ahead of
+/// the clock frames reached the renderer, how many came after their start (and so showed late),
+/// and how many were dropped.
 private struct Stats {
     let since = ContinuousClock.now
     /// Frames enqueued. While catching up they can still come too late to be seen.
@@ -319,8 +318,6 @@ private struct Stats {
     var enqueue = Duration.zero
     /// Waiting with the lead or the queue full, or at the end: nothing to do.
     var waitAhead = Duration.zero
-    /// Waiting on the renderer, which wasn't ready for more.
-    var waitRenderer = Duration.zero
     /// The most one frame took, from asking the decoder to having it enqueued.
     var worstFrame = Duration.zero
 
@@ -350,7 +347,7 @@ private struct Stats {
     /// One line, e.g.
     /// `Video mpeg4 at 24.000 fps: 720 enqueued, 0 dropped late, 0 forced, 12 dropped catching up in 30.0 s;
     /// per frame read 0.4 ms, decode 9.1 ms, convert 2.3 ms, enqueue 0.1 ms = 11.9 ms of 41.7 ms (worst 25.3 ms),
-    /// can decode 84 fps; thread busy 29%, waiting 71% ahead, 0% on the renderer; lead min 120 ms, median 480 ms;
+    /// can decode 84 fps; thread busy 29%, waiting 71% ahead; lead min 120 ms, median 480 ms;
     /// 0 enqueued over 10 ms after their start; thermal nominal`
     func report(codec: String, frameRate: Double, logger: Logger) {
         guard shown > 0 || dropped > 0 else { return }
@@ -371,7 +368,7 @@ private struct Stats {
         let lead = sorted.isEmpty ? "–" : "min \(leadMs(sorted[0])), median \(leadMs(sorted[sorted.count / 2]))"
         let text = "Video \(codec) at \(String(format: "%.3f", frameRate)) fps: \(shown) enqueued, \(lateDrops) dropped late, \(forcedShows) forced, \(catchUpDrops) dropped catching up in \(String(format: "%.1f", ms(elapsed) / 1000)) s; "
             + "per frame read \(perFrame(stages.read, decoded)), decode \(perFrame(stages.decode, decoded)), convert \(perFrame(stages.convert, converted)), enqueue \(perFrame(enqueue, shown)) = \(String(format: "%.1f", costMs)) ms of \(String(format: "%.1f", budgetMs)) ms (worst \(String(format: "%.1f", ms(worstFrame))) ms), can decode \(capacity); "
-            + "thread busy \(share(work)), waiting \(share(waitAhead)) ahead, \(share(waitRenderer)) on the renderer; "
+            + "thread busy \(share(work)), waiting \(share(waitAhead)) ahead; "
             + "lead \(lead); \(late) enqueued over 10 ms after their start; thermal \(ProcessInfo.processInfo.thermalState.logName)"
         if isDegraded {
             logger.warning("\(text)")
