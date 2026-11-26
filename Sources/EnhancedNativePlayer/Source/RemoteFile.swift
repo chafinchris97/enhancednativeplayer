@@ -25,8 +25,10 @@ final class RemoteFile: @unchecked Sendable {
     private let logger: Logger
     private let maxDiskBlocks: Int
     private let maxMemoryBlocks = 16
-    /// Streams, and so connections to the source, open at once.
-    static let maxStreams = 2
+    /// Streams, and so connections to the source, open at once. The video and audio remux,
+    /// a subtitle read and a demuxer's jump to the index can all want a different place at
+    /// once; with fewer streams than that they take them from each other and none gets far.
+    static let maxStreams = 4
     /// How far a stream reads past the furthest block asked of it before pausing.
     private let readAhead = 32
     /// A block this close past a stream's frontier is waited for instead of opening another stream.
@@ -178,9 +180,18 @@ final class RemoteFile: @unchecked Sendable {
                 if missed == nil {
                     missed = "waited on the stream \(index - reaching.frontier) blocks short of it (\(streams.count) open)"
                 }
-            } else {
-                stream = openStream(at: index)
+            } else if let opened = openStream(at: index) {
+                stream = opened
                 if missed == nil { missed = "no stream was reading near it, opened one (\(streams.count) open)" }
+            } else {
+                // Every stream has a reader waiting on it. Taking one would leave that reader
+                // to take another back, and so on, each restarting a request and none
+                // getting anywhere; wait for one to come free instead.
+                if missed == nil { missed = "every stream was serving another reader (\(streams.count) open)" }
+                waitingOn?.waiters -= 1
+                waitingOn = nil
+                _ = condition.wait(until: Date().addingTimeInterval(0.2))
+                continue
             }
             if stream !== waitingOn {
                 waitingOn?.waiters -= 1
@@ -315,12 +326,12 @@ final class RemoteFile: @unchecked Sendable {
         }
     }
 
-    private func openStream(at index: Int) -> Stream {
+    /// Opens a stream at `index`, closing the least recently used one nobody waits on if
+    /// all are open. Nil when every stream has a reader waiting on it.
+    private func openStream(at index: Int) -> Stream? {
         if streams.count >= Self.maxStreams {
-            let idle = streams.filter { $0.waiters == 0 }
-            if let victim = (idle.isEmpty ? streams : idle).min(by: { $0.lastUse < $1.lastUse }) {
-                cancel(victim)
-            }
+            guard let victim = streams.filter({ $0.waiters == 0 }).min(by: { $0.lastUse < $1.lastUse }) else { return nil }
+            cancel(victim)
         }
         let stream = Stream(at: index, chunk: firstChunk)
         streams.append(stream)
