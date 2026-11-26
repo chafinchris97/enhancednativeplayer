@@ -40,6 +40,33 @@ final class RenderedVideoDecoder {
 
     /// The codec, for logs.
     let codecName: String
+    /// The stream's frame rate, or the one its average frame duration gives; for logs.
+    let frameRate: Double
+
+    /// Where the decoding thread's time went since the last `takeStageTimes()`, for the log.
+    struct StageTimes {
+        /// Reading packets: the demuxer, and the block cache waiting on the network.
+        var read = Duration.zero
+        /// `avcodec_send_packet` and `avcodec_receive_frame`, which wait on the codec's threads.
+        var decode = Duration.zero
+        /// Turning frames into NV12 / P010 sample buffers.
+        var convert = Duration.zero
+        var packets = 0
+        /// Frames out of the decoder, those skipped on the way to a seek's target or dropped late included.
+        var decoded = 0
+        var converted = 0
+    }
+
+    private var stageTimes = StageTimes()
+
+    /// The times since the last call, and starts counting anew.
+    func takeStageTimes() -> StageTimes {
+        defer { stageTimes = StageTimes() }
+        return stageTimes
+    }
+    private let logger: Logger
+    /// A damaged stream fails every packet or frame alike.
+    private let throttle = LogThrottle()
 
     /// Called for every frame the decoder puts out, those skipped on the way to a seek's target
     /// included, on the decoding thread.
@@ -54,7 +81,8 @@ final class RenderedVideoDecoder {
         }
     }
 
-    init(file: RemoteFile, media: MediaInfo, originTicks: Int64, token: CancellationToken) throws {
+    init(file: RemoteFile, media: MediaInfo, originTicks: Int64, token: CancellationToken, logger: Logger) throws {
+        self.logger = logger
         let video = media.video
         guard let source = video.rendered else { throw EnhancedPlayerError.unsupportedVideoCodec("none") }
         codecName = source.codecName
@@ -65,6 +93,7 @@ final class RenderedVideoDecoder {
         self.originTicks = originTicks
         indexShift = media.keyframes.usesDecodeTimestamps ? media.keyframes.presentationOffset : 0
         frameTicks = max(1, video.timeBase.rescale(video.frameDuration, to: .ticks))
+        frameRate = video.frameRate ?? 10_000_000 / Double(frameTicks)
         converter = PixelBufferConverter(source: source)
 
         let stream = demuxer.stream(video.streamIndex)
@@ -85,7 +114,11 @@ final class RenderedVideoDecoder {
             throw error
         }
         codec = context
-        Logger.player.info("Decoding \(source.codecName) video with \(String(cString: decoder.pointee.name)), \(context.pointee.thread_count) threads")
+        // libavcodec's own decoders report the threads they started; dav1d picks its own and leaves 0.
+        let active = context.pointee.active_thread_type
+        let kind = [active & FF_THREAD_FRAME != 0 ? "frame" : nil, active & FF_THREAD_SLICE != 0 ? "slice" : nil].compactMap { $0 }.joined(separator: "+")
+        let threads = context.pointee.thread_count > 0 ? "\(context.pointee.thread_count) \(kind.isEmpty ? "" : kind + " ")threads" : "threads of its own choosing"
+        logger.notice("Decoding \(source.codecName) video with \(String(cString: decoder.pointee.name)), \(threads), \(ProcessInfo.processInfo.activeProcessorCount) cores")
     }
 
     deinit {
@@ -140,8 +173,12 @@ final class RenderedVideoDecoder {
     }
 
     private func sample(_ frame: UnsafeMutablePointer<AVFrame>, start: Int64, end: Int64) -> DecodedFrame? {
-        guard let sample = converter.sample(for: frame, start: start, end: end) else {
-            Logger.player.warning("Video frame in pixel format \(frame.pointee.format) not converted")
+        let started = ContinuousClock.now
+        let converted = converter.sample(for: frame, start: start, end: end)
+        stageTimes.convert += ContinuousClock.now - started
+        stageTimes.converted += 1
+        guard let sample = converted else {
+            throttle.log(logger, .warning, key: "convert") { "Video frame in pixel format \(frame.pointee.format) not converted" }
             return nil
         }
         return DecodedFrame(sample: sample, start: start, end: end)
@@ -152,8 +189,11 @@ final class RenderedVideoDecoder {
         guard let codec else { return nil }
         while true {
             guard let frame = av_frame_alloc() else { throw EnhancedPlayerError.ffmpeg(operation: "av_frame_alloc", code: -ENOMEM, message: "out of memory") }
+            let receiving = ContinuousClock.now
             let received = avcodec_receive_frame(codec, frame)
+            stageTimes.decode += ContinuousClock.now - receiving
             if received == 0 {
+                stageTimes.decoded += 1
                 onFrameDecoded?()
                 let ts = frame.pointee.best_effort_timestamp
                 var start = ts == FF.noPTS ? (lastStart == .min ? 0 : lastStart + frameTicks) : timeBase.rescale(ts, to: .ticks) - originTicks
@@ -167,12 +207,18 @@ final class RenderedVideoDecoder {
                 throw EnhancedPlayerError.ffmpeg(operation: "avcodec_receive_frame", code: received, message: FF.errorString(received))
             }
             if draining { return nil }
-            if try demuxer.read(into: packet) {
+            let reading = ContinuousClock.now
+            let read = try demuxer.read(into: packet)
+            stageTimes.read += ContinuousClock.now - reading
+            if read {
                 guard packet.streamIndex == streamIndex else { continue }
+                stageTimes.packets += 1
+                let sending = ContinuousClock.now
                 let sent = avcodec_send_packet(codec, packet.pointer)
+                stageTimes.decode += ContinuousClock.now - sending
                 // A damaged packet costs a frame, not the stream.
                 if sent < 0, sent != FF.errorEAGAIN {
-                    Logger.player.warning("Video packet not decoded: \(FF.errorString(sent))")
+                    throttle.log(logger, .warning, key: "packet") { "Video packet not decoded: \(FF.errorString(sent))" }
                 }
             } else {
                 draining = true

@@ -27,6 +27,8 @@ final class RenderedVideoFeeder: @unchecked Sendable {
     static let leadTicks: Int64 = 5_000_000
     /// Memory the queued frames may take.
     static let queueBytes = 160 << 20
+    /// A catch-up after a seek longer than this is logged: the image has been still that long.
+    static let slowCatchUp = Duration.seconds(2)
     /// A clock this close to a target the server named has reached it.
     static let arrivedTicks: Int64 = 10_000_000
 
@@ -35,6 +37,7 @@ final class RenderedVideoFeeder: @unchecked Sendable {
     private let token: CancellationToken
     private let maxQueued: Int
     private let makeDecoder: @Sendable () throws -> RenderedVideoDecoder
+    private let logger: Logger
 
     private let condition = NSCondition()
     private var stopped = false
@@ -49,8 +52,9 @@ final class RenderedVideoFeeder: @unchecked Sendable {
     /// - Parameters:
     ///   - startTicks: Where the clock is now, on the playlist timeline.
     ///   - frameBytes: Size of one converted frame, which limits how many are queued.
-    init(renderer: AVSampleBufferVideoRenderer, timebase: CMTimebase, startTicks: Int64, frameBytes: Int, token: CancellationToken, makeDecoder: @escaping @Sendable () throws -> RenderedVideoDecoder) {
+    init(renderer: AVSampleBufferVideoRenderer, timebase: CMTimebase, startTicks: Int64, frameBytes: Int, token: CancellationToken, logger: Logger, makeDecoder: @escaping @Sendable () throws -> RenderedVideoDecoder) {
         self.renderer = renderer
+        self.logger = logger
         self.timebase = timebase
         self.token = token
         self.maxQueued = min(48, max(4, Self.queueBytes / max(1, frameBytes)))
@@ -133,7 +137,7 @@ final class RenderedVideoFeeder: @unchecked Sendable {
         do {
             decoder = try makeDecoder()
         } catch {
-            if !token.isCancelled { Logger.player.error("Video decoder not opened: \(error)") }
+            if !token.isCancelled { logger.error("Video decoder not opened: \(error)") }
             return
         }
         decoder.onFrameDecoded = { [unowned self] in
@@ -148,6 +152,8 @@ final class RenderedVideoFeeder: @unchecked Sendable {
         /// Set from a seek until a frame is enqueued in time.
         var catchingUp = false
         var caughtUpFrom: ContinuousClock.Instant?
+        /// Whether this catch-up has been reported as taking too long.
+        var warnedSlowCatchUp = false
         /// The target of the seek under way, until its first frame is enqueued.
         var seekingTo: Int64?
         var stats = Stats()
@@ -172,25 +178,26 @@ final class RenderedVideoFeeder: @unchecked Sendable {
                 if !covered, jumped != seekingTo { seekTarget = jumped }
             }
             if renderer.status == .failed {
-                Logger.player.warning("Video renderer failed: \(String(describing: renderer.error)); restarting at the clock")
+                logger.warning("Video renderer failed: \(String(describing: renderer.error)); restarting at the clock")
                 seekTarget = clock
             } else if renderer.requiresFlushToResumeDecoding {
                 seekTarget = clock
             }
             if let target = seekTarget {
-                Logger.player.info("Video: decoding from the keyframe before \(String(format: "%.3f", Double(target) / 1e7)) s (clock at \(String(format: "%.3f", Double(timebaseTicks) / 1e7)) s)")
+                logger.info("Video: decoding from the keyframe before \(String(format: "%.3f", Double(target) / 1e7)) s (clock at \(String(format: "%.3f", Double(timebaseTicks) / 1e7)) s)")
                 renderer.flush(removingDisplayedImage: false, completionHandler: nil)
                 queued = []
                 publish(queued)
                 atEnd = false
                 catchingUp = true
                 caughtUpFrom = .now
+                warnedSlowCatchUp = false
                 seekingTo = target
                 do {
                     try decoder.seek(toTicks: target)
                 } catch {
                     if token.isCancelled { break }
-                    Logger.player.error("Video seek to \(target / 10_000) ms failed: \(error)")
+                    logger.error("Video seek to \(target / 10_000) ms failed: \(error)")
                     atEnd = true
                 }
                 continue
@@ -198,93 +205,178 @@ final class RenderedVideoFeeder: @unchecked Sendable {
             publish(queued)
 
             let ahead = (queued.last?.end ?? clock) - clock
-            if atEnd || queued.count >= maxQueued || ahead >= Self.leadTicks || !renderer.isReadyForMoreMediaData {
+            let enough = atEnd || queued.count >= maxQueued || ahead >= Self.leadTicks
+            if enough || !renderer.isReadyForMoreMediaData {
+                let waiting = ContinuousClock.now
                 condition.lock()
                 if !stopped, jump == nil { condition.wait(until: Date(timeIntervalSinceNow: 0.01)) }
                 condition.unlock()
+                if enough {
+                    stats.waitAhead += ContinuousClock.now - waiting
+                } else {
+                    stats.waitRenderer += ContinuousClock.now - waiting
+                }
                 continue
             }
 
             do {
                 let started = ContinuousClock.now
+                // A seek's first frame takes everything from its keyframe on: not one frame's cost.
+                let timesOneFrame = !catchingUp
                 // Catching up while the clock runs: frames nothing refers to can go undecoded. Paused,
                 // the frame at the target must be the exact one.
                 decoder.skipsUnreferencedFrames = catchingUp && CMTimebaseGetRate(timebase) > 0
                 let decoded = try decoder.next(skip: { end in
                     guard end <= self.now else { return false }
-                    if !catchingUp, ContinuousClock.now - lastShown >= .milliseconds(250) { return false }
-                    stats.dropped += 1
+                    if catchingUp {
+                        stats.catchUpDrops += 1
+                        return true
+                    }
+                    if ContinuousClock.now - lastShown >= .milliseconds(250) {
+                        stats.forcedShows += 1
+                        return false
+                    }
+                    stats.lateDrops += 1
                     return true
                 }, interrupted: { [unowned self] in
                     condition.lock()
                     defer { condition.unlock() }
                     return stopped || jump != nil
                 })
-                stats.decodeTime += ContinuousClock.now - started
+                stats.add(decoder.takeStageTimes())
+                // Frames are dropped until one is in time, so a decoder slower than playback never
+                // gets back on the clock and the image stays where the seek left it.
+                if catchingUp, let from = caughtUpFrom, ContinuousClock.now - from > Self.slowCatchUp {
+                    stats.slowCatchUp = true
+                    if !warnedSlowCatchUp {
+                        warnedSlowCatchUp = true
+                        logger.warning("Video: still not on the clock \((ContinuousClock.now - from).formatted(.units(allowed: [.milliseconds]))) after the seek; the image stays frozen until a frame is decoded in time")
+                    }
+                }
                 guard let decoded else {
                     atEnd = true
                     continue
                 }
+                let enqueueing = ContinuousClock.now
                 renderer.enqueue(decoded.sample)
+                stats.enqueue += ContinuousClock.now - enqueueing
+                stats.shown += 1
+                if timesOneFrame { stats.worstFrame = max(stats.worstFrame, ContinuousClock.now - started) }
                 queued.append((decoded.start, decoded.end))
                 publish(queued)
                 seekingTo = nil
                 lastShown = ContinuousClock.now
-                let lead = decoded.start - now
-                stats.record(lead: lead)
+                // The frame that ends a catch-up is late by design; only frames on the clock count.
+                if timesOneFrame { stats.record(lead: decoded.start - now) }
                 if catchingUp, decoded.end > now {
                     catchingUp = false
                     decoder.skipsUnreferencedFrames = false
                     if let from = caughtUpFrom {
-                        Logger.player.info("Video: on the clock \(ContinuousClock.now - from) after the seek")
+                        logger.info("Video: on the clock \((ContinuousClock.now - from).formatted(.units(allowed: [.milliseconds]))) after the seek")
                     }
                     caughtUpFrom = nil
                 }
             } catch is RenderedVideoDecoder.Interrupted {
                 // A jump or a stop: the loop takes it from here.
+                stats.add(decoder.takeStageTimes())
                 continue
             } catch {
                 if token.isCancelled { break }
-                Logger.player.error("Video decoding stopped: \(error)")
+                logger.error("Video decoding stopped: \(error)")
                 atEnd = true
             }
-            if ContinuousClock.now - stats.since > .seconds(5) {
-                stats.report(codec: decoder.codecName)
+            // Every 30 s while all is well, every 5 s while frames come late or are dropped.
+            let age = ContinuousClock.now - stats.since
+            if age > .seconds(30) || (age > .seconds(5) && stats.isDegraded) {
+                stats.report(codec: decoder.codecName, frameRate: decoder.frameRate, logger: logger)
                 stats = Stats()
             }
         }
+        // What the last window saw, so the end of a session isn't missing from the log.
+        stats.add(decoder.takeStageTimes())
+        stats.report(codec: decoder.codecName, frameRate: decoder.frameRate, logger: logger)
     }
 }
 
-/// What the video thread did over a few seconds, for the log: how far ahead of the clock frames
-/// reached the renderer, how many came after their start (and so showed late), and how many were
-/// dropped.
+/// What the video thread did over a window of playback, for the log: where its time went (reading
+/// packets, decoding, converting, enqueueing, and waiting, either with enough queued or on a
+/// renderer that takes no more), how far ahead of the clock frames reached the renderer, how many
+/// came after their start (and so showed late), and how many were dropped.
 private struct Stats {
     let since = ContinuousClock.now
+    /// Frames enqueued. While catching up they can still come too late to be seen.
+    var shown = 0
+    /// How far ahead of the clock each frame on the clock was enqueued.
     var leads: [Int64] = []
     var late = 0
-    var dropped = 0
-    var decodeTime = Duration.zero
+    /// Dropped undrawn on the way back to the clock after a seek: expected.
+    var catchUpDrops = 0
+    /// Dropped once on the clock because they came too late: the decoder fell behind.
+    var lateDrops = 0
+    /// Late frames shown anyway because none had been for 250 ms.
+    var forcedShows = 0
+    var stages = RenderedVideoDecoder.StageTimes()
+    var enqueue = Duration.zero
+    /// Waiting with the lead or the queue full, or at the end: nothing to do.
+    var waitAhead = Duration.zero
+    /// Waiting on the renderer, which wasn't ready for more.
+    var waitRenderer = Duration.zero
+    /// The most one frame took, from asking the decoder to having it enqueued.
+    var worstFrame = Duration.zero
+
+    /// A catch-up in this window went on past `slowCatchUp`.
+    var slowCatchUp = false
+
+    var dropped: Int { catchUpDrops + lateDrops }
+    var isDegraded: Bool { late > 0 || lateDrops > 0 || forcedShows > 0 || slowCatchUp }
+
+    /// A frame this far past its start when enqueued shows visibly late: more than half a 60 Hz refresh.
+    static let lateTicks: Int64 = 100_000
 
     mutating func record(lead: Int64) {
         leads.append(lead)
-        if lead < 0 { late += 1 }
+        if lead < -Self.lateTicks { late += 1 }
     }
 
-    func report(codec: String) {
-        guard !leads.isEmpty || dropped > 0 else { return }
+    mutating func add(_ times: RenderedVideoDecoder.StageTimes) {
+        stages.read += times.read
+        stages.decode += times.decode
+        stages.convert += times.convert
+        stages.packets += times.packets
+        stages.decoded += times.decoded
+        stages.converted += times.converted
+    }
+
+    /// One line, e.g.
+    /// `Video mpeg4 at 24.000 fps: 720 enqueued, 0 dropped late, 0 forced, 12 dropped catching up in 30.0 s;
+    /// per frame read 0.4 ms, decode 9.1 ms, convert 2.3 ms, enqueue 0.1 ms = 11.9 ms of 41.7 ms (worst 25.3 ms),
+    /// can decode 84 fps; thread busy 29%, waiting 71% ahead, 0% on the renderer; lead min 120 ms, median 480 ms;
+    /// 0 enqueued over 10 ms after their start; thermal nominal`
+    func report(codec: String, frameRate: Double, logger: Logger) {
+        guard shown > 0 || dropped > 0 else { return }
         let elapsed = ContinuousClock.now - since
+        func ms(_ duration: Duration) -> Double { Double(duration.components.seconds) * 1000 + Double(duration.components.attoseconds) / 1e15 }
+        func perFrame(_ duration: Duration, _ count: Int) -> String { count > 0 ? String(format: "%.1f ms", ms(duration) / Double(count)) : "–" }
+        func share(_ duration: Duration) -> String { String(format: "%.0f%%", 100 * ms(duration) / max(1, ms(elapsed))) }
+        let decoded = max(1, stages.decoded)
+        let converted = max(1, stages.converted)
+        let work = stages.read + stages.decode + stages.convert + enqueue
+        // What one shown frame costs: reading and decoding are paid for every decoded frame, the
+        // conversion and enqueue for the converted and shown ones.
+        let costMs = ms(stages.read + stages.decode) / Double(decoded) + ms(stages.convert) / Double(converted) + (shown > 0 ? ms(enqueue) / Double(shown) : 0)
+        let budgetMs = 1000 / frameRate
+        let capacity = costMs > 0 ? String(format: "%.0f fps", 1000 / costMs) : "–"
         let sorted = leads.sorted()
-        func ms(_ ticks: Int64) -> String { String(format: "%.0f", Double(ticks) / 10_000) }
-        let frames = leads.count + dropped
-        let seconds = Double(decodeTime.components.seconds) + Double(decodeTime.components.attoseconds) / 1e18
-        let rate = seconds > 0 ? String(format: "%.0f", Double(frames) / seconds) : "–"
-        let lead = sorted.isEmpty ? "–" : "min \(ms(sorted[0])) ms, median \(ms(sorted[sorted.count / 2])) ms"
-        let text = "Video \(codec): \(leads.count) frames shown, \(dropped) dropped in \(elapsed); decoding \(rate) fps; lead at enqueue \(lead); \(late) enqueued after their start"
-        if late > 0 || dropped > 0 {
-            Logger.player.warning("\(text)")
+        func leadMs(_ ticks: Int64) -> String { String(format: "%.0f ms", Double(ticks) / 10_000) }
+        let lead = sorted.isEmpty ? "–" : "min \(leadMs(sorted[0])), median \(leadMs(sorted[sorted.count / 2]))"
+        let text = "Video \(codec) at \(String(format: "%.3f", frameRate)) fps: \(shown) enqueued, \(lateDrops) dropped late, \(forcedShows) forced, \(catchUpDrops) dropped catching up in \(String(format: "%.1f", ms(elapsed) / 1000)) s; "
+            + "per frame read \(perFrame(stages.read, decoded)), decode \(perFrame(stages.decode, decoded)), convert \(perFrame(stages.convert, converted)), enqueue \(perFrame(enqueue, shown)) = \(String(format: "%.1f", costMs)) ms of \(String(format: "%.1f", budgetMs)) ms (worst \(String(format: "%.1f", ms(worstFrame))) ms), can decode \(capacity); "
+            + "thread busy \(share(work)), waiting \(share(waitAhead)) ahead, \(share(waitRenderer)) on the renderer; "
+            + "lead \(lead); \(late) enqueued over 10 ms after their start; thermal \(ProcessInfo.processInfo.thermalState.logName)"
+        if isDegraded {
+            logger.warning("\(text)")
         } else {
-            Logger.player.info("\(text)")
+            logger.info("\(text)")
         }
     }
 }

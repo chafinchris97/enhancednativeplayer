@@ -175,7 +175,7 @@ struct RenderedVideoEndToEndTests {
         defer { window.orderOut(nil) }
         let renderer = layer.sampleBufferRenderer
         let token = CancellationToken()
-        let feeder = RenderedVideoFeeder(renderer: renderer, timebase: timebase, startTicks: 0, frameBytes: session.videoFrameBytes, token: token) {
+        let feeder = RenderedVideoFeeder(renderer: renderer, timebase: timebase, startTicks: 0, frameBytes: session.videoFrameBytes, token: token, logger: session.logger) {
             try session.makeVideoDecoder(token: token)
         }
         defer { feeder.stop() }
@@ -244,7 +244,7 @@ struct RenderedVideoEndToEndTests {
         window.orderFrontRegardless()
         defer { window.orderOut(nil) }
         let token = CancellationToken()
-        let feeder = RenderedVideoFeeder(renderer: layer.sampleBufferRenderer, timebase: timebase, startTicks: 0, frameBytes: session.videoFrameBytes, token: token) {
+        let feeder = RenderedVideoFeeder(renderer: layer.sampleBufferRenderer, timebase: timebase, startTicks: 0, frameBytes: session.videoFrameBytes, token: token, logger: session.logger) {
             try session.makeVideoDecoder(token: token)
         }
         defer { feeder.stop() }
@@ -368,7 +368,7 @@ struct VideoStartGateTests {
             progress: { queued.withLock { $0 == nil ? 0 : 1 } }
         ))
         let started = ContinuousClock.now
-        await gate.hold(segment: 3, range: 20_000_000..<30_000_000, startsRun: true, logger: Logger.player)
+        await gate.hold(segment: 3, range: 20_000_000..<30_000_000, startsRun: true, logger: Logger.systemDefault)
         let took = ContinuousClock.now - started
         #expect(decodeAsked.withLock { $0 } == 25_000_000)
         #expect(queued.withLock { $0 } != nil)
@@ -381,9 +381,9 @@ struct VideoStartGateTests {
         gate.attach(VideoStartGate.Source(reportedTicks: { 5_000_000 }, decode: { _ in asked.withLock { $0 = true } }, covers: { _ in false }, progress: { 0 }))
         let started = ContinuousClock.now
         // AVPlayer at 0.5 s filling its buffer with the segment from 60 s.
-        await gate.hold(segment: 6, range: 600_000_000..<700_000_000, startsRun: false, logger: Logger.player)
+        await gate.hold(segment: 6, range: 600_000_000..<700_000_000, startsRun: false, logger: Logger.systemDefault)
         #expect(ContinuousClock.now - started < .milliseconds(100))
-        await gate.hold(segment: 6, range: 600_000_000..<700_000_000, startsRun: true, logger: Logger.player)
+        await gate.hold(segment: 6, range: 600_000_000..<700_000_000, startsRun: true, logger: Logger.systemDefault)
         #expect(ContinuousClock.now - started < VideoStartGate.reportWait + .milliseconds(200))
         #expect(!asked.withLock { $0 })
     }
@@ -392,7 +392,7 @@ struct VideoStartGateTests {
         let gate = VideoStartGate()
         gate.attach(VideoStartGate.Source(reportedTicks: { 0 }, decode: { _ in }, covers: { _ in false }, progress: { 0 }))
         let started = ContinuousClock.now
-        await gate.hold(segment: 0, range: 0..<60_000_000, startsRun: true, logger: Logger.player)
+        await gate.hold(segment: 0, range: 0..<60_000_000, startsRun: true, logger: Logger.systemDefault)
         let took = ContinuousClock.now - started
         #expect(took >= VideoStartGate.timeout - .milliseconds(100) && took < VideoStartGate.timeout + .seconds(1))
     }
@@ -407,7 +407,7 @@ struct VideoStartGateTests {
             progress: { progress.withLock { $0 } }
         ))
         let started = ContinuousClock.now
-        await gate.hold(segment: 0, range: 0..<60_000_000, startsRun: true, logger: Logger.player)
+        await gate.hold(segment: 0, range: 0..<60_000_000, startsRun: true, logger: Logger.systemDefault)
         let took = ContinuousClock.now - started
         #expect(took >= VideoStartGate.stall && took < VideoStartGate.stall + .seconds(1))
     }

@@ -115,14 +115,14 @@ final class SegmentPipeline: @unchecked Sendable {
                     return
                 }
                 if run != nil, requestedTrack != track {
-                    logger.info("\(name): track \(track) → \(requestedTrack), restarting at \(index)")
+                    logger.notice("\(name): track \(track) → \(requestedTrack), restarting at \(index)")
                     restart(at: index, track: requestedTrack)
                 } else if let url = ready.removeValue(forKey: index) {
                     advance(to: index)
                     continuation.resume(returning: url)
                     return
                 } else if needsRestart(for: index) {
-                    logger.info("\(name): segment \(index) is outside the window (producing \(producing)), restarting")
+                    logger.notice("\(name): segment \(index) is outside the window (producing \(producing)), restarting")
                     restart(at: index, track: requestedTrack)
                 } else {
                     advance(to: index)

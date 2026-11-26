@@ -16,6 +16,7 @@ import UIKit
 @MainActor
 final class RenderedVideoRenderer {
     private let session: EnhancedPlaybackSession
+    private let logger: Logger
     private let view = RenderedVideoView()
     private weak var item: AVPlayerItem?
     private var feeder: RenderedVideoFeeder?
@@ -27,6 +28,7 @@ final class RenderedVideoRenderer {
     ///   - container: `contentOverlayView`, where a view follows the player's size.
     init(session: EnhancedPlaybackSession, playerView: UIView, container: UIView) {
         self.session = session
+        logger = session.logger.category(.video)
         view.playerView = playerView
         view.frame = container.bounds
         view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
@@ -49,7 +51,7 @@ final class RenderedVideoRenderer {
             }
             guard let self, !Task.isCancelled, self.item === item else { return }
             guard let timebase else {
-                Logger.player.error("The player item has no timebase to show the video on")
+                logger.error("The player item has no timebase to show the video on")
                 return
             }
             self.start(item: item, timebase: timebase)
@@ -72,10 +74,11 @@ final class RenderedVideoRenderer {
             startTicks: Self.ticks(item.currentTime()),
             frameBytes: session.videoFrameBytes,
             token: token,
+            logger: logger,
             makeDecoder: { try session.makeVideoDecoder(token: token) }
         )
         self.feeder = feeder
-        Logger.player.info("Drawing the video (\(Int(size.width))×\(Int(size.height))) \(view.isUnderPlayerSubtitles ? "under AVPlayer's subtitles" : "in the content overlay, above AVPlayer's subtitles: its subtitle layer wasn't found")")
+        logger.info("Drawing the video (\(Int(size.width))×\(Int(size.height))) \(view.isUnderPlayerSubtitles ? "under AVPlayer's subtitles" : "in the content overlay, above AVPlayer's subtitles: its subtitle layer wasn't found")")
         jumpObserver = NotificationCenter.default.addObserver(forName: AVPlayerItem.timeJumpedNotification, object: item, queue: .main) { [weak feeder] notification in
             guard let item = notification.object as? AVPlayerItem else { return }
             let time = item.currentTime()

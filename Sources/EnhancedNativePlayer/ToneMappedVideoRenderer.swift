@@ -24,12 +24,14 @@ final class ToneMappedVideoRenderer {
     private var displayLink: CADisplayLink?
     private var formatDescription: CMVideoFormatDescription?
     private var loggedFirstFrame = false
+    private let logger: Logger
 
     /// - Parameters:
     ///   - playerView: The player view controller's view, which holds AVPlayer's layer.
     ///   - container: `contentOverlayView`, where a view follows the player's size.
-    init(color: SourceHDRColor, playerView: UIView, container: UIView) {
+    init(color: SourceHDRColor, playerView: UIView, container: UIView, logger: Logger) {
         self.color = color
+        self.logger = logger
         view.playerView = playerView
         view.frame = container.bounds
         view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
@@ -56,7 +58,7 @@ final class ToneMappedVideoRenderer {
         let link = CADisplayLink(target: DisplayLinkTarget { [weak self] link in self?.refresh(link) }, selector: #selector(DisplayLinkTarget.tick))
         link.add(to: .main, forMode: .common)
         displayLink = link
-        Logger.player.info("Tone mapping the SDR master's video (\(color.range.rawValue)\(color.metadata?.masteringDisplay == nil ? "" : ", mastering display")\(color.metadata?.contentLightLevel == nil ? "" : ", content light level")) \(view.isUnderPlayerSubtitles ? "under AVPlayer's subtitles" : "in the content overlay, above AVPlayer's subtitles: its subtitle layer wasn't found")")
+        logger.info("Tone mapping the SDR master's video (\(color.range.rawValue)\(color.metadata?.masteringDisplay == nil ? "" : ", mastering display")\(color.metadata?.contentLightLevel == nil ? "" : ", content light level")) \(view.isUnderPlayerSubtitles ? "under AVPlayer's subtitles" : "in the content overlay, above AVPlayer's subtitles: its subtitle layer wasn't found")")
     }
 
     func stop() {
@@ -85,13 +87,13 @@ final class ToneMappedVideoRenderer {
         color.apply(to: buffer)
         guard let sample = sample(for: buffer, time: shownTime.isValid ? shownTime : itemTime) else { return }
         if renderer.status == .failed {
-            Logger.player.error("Tone mapped video layer failed: \(renderer.error.map { "\($0)" } ?? "no error"), flushing")
+            logger.error("Tone mapped video layer failed: \(renderer.error.map { "\($0)" } ?? "no error"), flushing")
             renderer.flush()
         }
         renderer.enqueue(sample)
         if !loggedFirstFrame {
             loggedFirstFrame = true
-            Logger.player.info("Tone mapped video: first frame \(CVPixelBufferGetWidth(buffer))×\(CVPixelBufferGetHeight(buffer)) \(String(format: "%08X", CVPixelBufferGetPixelFormatType(buffer)))")
+            logger.info("Tone mapped video: first frame \(CVPixelBufferGetWidth(buffer))×\(CVPixelBufferGetHeight(buffer)) \(String(format: "%08X", CVPixelBufferGetPixelFormatType(buffer)))")
         }
     }
 

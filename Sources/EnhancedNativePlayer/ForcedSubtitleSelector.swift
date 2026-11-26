@@ -14,6 +14,7 @@ import Logging
 @MainActor
 final class ForcedSubtitleSelector {
     private let session: EnhancedPlaybackSession
+    private let logger: Logger
     private weak var player: AVPlayer?
     private var observer: NSObjectProtocol?
     private var audioName: String?
@@ -22,6 +23,7 @@ final class ForcedSubtitleSelector {
 
     init(session: EnhancedPlaybackSession, player: AVPlayer, item: AVPlayerItem) {
         self.session = session
+        logger = session.logger.category(.subtitles)
         self.player = player
         observer = NotificationCenter.default.addObserver(forName: AVPlayerItem.mediaSelectionDidChangeNotification, object: item, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.update(item) }
@@ -59,7 +61,7 @@ final class ForcedSubtitleSelector {
             let wanted = self.session.forcedSubtitleName(forAudioNamed: audio)
             guard wanted != current else { return }
             let option = wanted.flatMap { name in legible.options.first { $0.renditionName == name } }
-            Logger.player.info("Forced subtitles for \(audio): \(option?.renditionName ?? "none")")
+            logger.info("Forced subtitles for \(audio): \(option?.renditionName ?? "none")")
             item.select(option, in: legible)
         }
     }

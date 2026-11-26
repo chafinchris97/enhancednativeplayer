@@ -45,7 +45,7 @@ final class RemoteFile: @unchecked Sendable {
     var blockCount: Int { Int((length + Int64(blockSize) - 1) / Int64(blockSize)) }
 
     /// Opens the file with a range request for the first block, which also yields its length.
-    static func open(url: URL, headers: [String: String], directory: URL, blockSize: Int = 1 << 20, diskBudget: Int64, logger: Logger = .player) async throws -> RemoteFile {
+    static func open(url: URL, headers: [String: String], directory: URL, blockSize: Int = 1 << 20, diskBudget: Int64, logger: Logger) async throws -> RemoteFile {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let configuration = URLSessionConfiguration.default
         configuration.httpMaximumConnectionsPerHost = 6

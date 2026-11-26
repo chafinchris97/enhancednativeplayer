@@ -117,11 +117,13 @@ final class HLSServer: Sendable {
                 }
                 let ticks = request.query["runtimeTicks"].flatMap { Int64($0) }
                 // One line when a request arrives and one when it is answered, so a stall shows
-                // which file the player is waiting on.
-                logger.info("GET \(file)")
+                // which file the player is waiting on. Debug: there are thousands in a film.
+                logger.debug("GET \(file)")
                 let started = ContinuousClock.now
                 let response = await session.respond(to: file, runtimeTicks: ticks)
-                logger.info("GET \(file) → \(response.status.code) in \((ContinuousClock.now - started).formatted(.units(allowed: [.milliseconds])))")
+                // A 404 can be meant (the withheld iframe.m3u8, a segment past the end).
+                let level: Logger.Level = response.status.code >= 500 ? .warning : response.status.code >= 400 ? .info : .debug
+                logger.log(level: level, "GET \(file) → \(response.status.code) in \((ContinuousClock.now - started).formatted(.units(allowed: [.milliseconds])))")
                 return response
             },
             onFailure: { [weak self] error in

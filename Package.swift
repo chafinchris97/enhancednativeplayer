@@ -50,6 +50,7 @@ let package = Package(
                 .product(name: "Logging", package: "swift-log"),
                 "EPLibass",
                 "PixelInterleave",
+                "FFmpegLogBridge",
             ]
         ),
         // libass with its assembly, and the FreeType, FriBidi and HarfBuzz it needs, as one
@@ -62,6 +63,8 @@ let package = Package(
         binary("EPLibswresample"),
         // Plane interleaving for decoded video frames, in C with NEON so it is fast in a debug build too.
         .target(name: "PixelInterleave"),
+        // libav*'s log callback takes a va_list, which Swift can't receive; this formats the line in C.
+        .target(name: "FFmpegLogBridge", dependencies: ["EPLibavutil"]),
         .testTarget(
             name: "EnhancedNativePlayerTests",
             dependencies: ["EnhancedNativePlayer"]

@@ -313,6 +313,9 @@ final class ASSSubtitleRenderer {
     private static let refillTicks: Int64 = 3_000_000
 
     private let session: EnhancedPlaybackSession
+    private let logger: Logger
+    /// Rendering that can't keep up says so on every plan.
+    private let throttle = LogThrottle()
     private let overlay = ASSOverlayView()
     private weak var player: AVPlayer?
     private weak var item: AVPlayerItem?
@@ -345,6 +348,8 @@ final class ASSSubtitleRenderer {
 
     init(session: EnhancedPlaybackSession, container: UIView) {
         self.session = session
+        logger = session.logger.category(.subtitles)
+        overlay.logger = logger
         overlay.frame = container.bounds
         overlay.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         overlay.isUserInteractionEnabled = false
@@ -438,16 +443,16 @@ final class ASSSubtitleRenderer {
         // A new engine has no layout yet.
         overlay.layout = nil
         guard let track, let player, let item else { return }
-        Logger.player.info("Drawing ASS track \(track) with libass")
+        logger.info("Drawing ASS track \(track) with libass")
         let header = session.assHeader(track: track)
         let matrix = session.videoColorMatrix
         let selection = selection
-        setupTask = Task { [weak self, session] in
+        setupTask = Task { [weak self, session, logger] in
             let fonts: [ASSFont]
             do {
                 fonts = try await session.assFonts()
             } catch {
-                if !(error is CancellationError) { Logger.player.warning("Attached fonts not read: \(error)") }
+                if !(error is CancellationError) { logger.warning("Attached fonts not read: \(error)") }
                 fonts = []
             }
             // Font setup can take a moment, so it stays off the main thread.
@@ -456,15 +461,15 @@ final class ASSSubtitleRenderer {
             }.value
             guard let self, !Task.isCancelled, self.selection == selection, self.item === item else { return }
             guard let engine else {
-                Logger.player.error("libass could not be initialised for track \(track)")
+                logger.error("libass could not be initialised for track \(track)")
                 return
             }
             // The item has a timebase once it has a player; the selection can't exist before that.
             guard let timebase = item.timebase else {
-                Logger.player.error("The player item has no timebase to show ASS track \(track) on")
+                logger.error("The player item has no timebase to show ASS track \(track) on")
                 return
             }
-            Logger.player.info("libass ready for track \(track) with \(fonts.count) attached fonts")
+            logger.info("libass ready for track \(track) with \(fonts.count) attached fonts")
             self.engine = engine
             if self.overlay.timebase !== timebase { self.overlay.attach(timebase: timebase) }
             for segment in self.segments.values { engine.add(segment.events) }
@@ -542,7 +547,7 @@ final class ASSSubtitleRenderer {
             replacing = false
         } else if let enqueued, isCurrent(enqueued.generation), !rendering, now >= enqueued.end, now - enqueued.end < Self.leadTicks {
             // Played past everything enqueued: the last image has been held over frames it doesn't belong to.
-            Logger.player.warning("ASS: subtitles ran out \((now - enqueued.end) / 10_000) ms ago; rendering can't keep up")
+            throttle.log(logger, .warning, key: "ran out") { "ASS: subtitles ran out \((now - enqueued.end) / 10_000) ms ago; rendering can't keep up" }
         }
         guard !rendering else {
             needsPlan = true
@@ -568,7 +573,7 @@ final class ASSSubtitleRenderer {
             let took = ContinuousClock.now - started
             let span = Duration.nanoseconds((end - frames[0]) * 100)
             if took > span {
-                Logger.player.warning("ASS: rendering \(span) of subtitles took \(took), slower than playback")
+                self.throttle.log(self.logger, .warning, key: "slow") { "ASS: rendering \(span) of subtitles took \(took), slower than playback" }
             }
             // A seek since the render began threw away what these samples follow on from.
             if self.isCurrent(rendered), self.epoch == epoch {
@@ -656,7 +661,7 @@ final class ASSSubtitleRenderer {
                     if !(error is CancellationError) {
                         // Kept as empty so it isn't read again on every tick; a new selection retries.
                         self.segments[index] = ASSSegment(events: [], frameTicks: [])
-                        Logger.player.warning("ASS segment \(index) of track \(track) not read: \(error)")
+                        logger.warning("ASS segment \(index) of track \(track) not read: \(error)")
                     }
                     return
                 }
@@ -676,6 +681,8 @@ final class ASSSubtitleRenderer {
 
 /// Hosts the `AVSampleBufferDisplayLayer` the subtitle samples are presented in.
 private final class ASSOverlayView: UIView {
+    /// The renderer's, set when it makes the view.
+    var logger = Logger.systemDefault
     private var displayLayer: AVSampleBufferDisplayLayer?
     var layout: LibassRenderer.Layout?
     var onLayout: (() -> Void)?
@@ -713,7 +720,7 @@ private final class ASSOverlayView: UIView {
         }
         // A layer that failed takes no more samples until flushed.
         if displayLayer.status == .failed {
-            Logger.player.warning("ASS sample layer failed: \(String(describing: displayLayer.error))")
+            logger.warning("ASS sample layer failed: \(String(describing: displayLayer.error))")
         }
     }
 

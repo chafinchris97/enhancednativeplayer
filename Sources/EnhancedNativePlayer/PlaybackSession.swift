@@ -34,12 +34,16 @@ final class EnhancedPlaybackSession: Sendable {
     /// The container's chapters, in seconds of the file's timeline.
     let fileChapters: [Chapter]
 
+    /// The session's logger: every line carries its `session` ID. Tag lines with `category(_:)`.
+    let logger: Logger
+
     private let core: PlaybackSessionCore
     private let server: HLSServer
     private let renderedKeyframeTicks = Mutex<[Int64]?>(nil)
 
-    private init(masterPlaylistURL: URL, core: PlaybackSessionCore, server: HLSServer) {
+    private init(masterPlaylistURL: URL, core: PlaybackSessionCore, server: HLSServer, logger: Logger) {
         self.masterPlaylistURL = masterPlaylistURL
+        self.logger = logger
         self.sdrMasterPlaylistURL = !core.context.hasSDRMaster ? nil : masterPlaylistURL.deletingLastPathComponent().appendingPathComponent("master_sdr.m3u8")
         self.isHDR = core.context.media.video.isHDR
         self.core = core
@@ -63,8 +67,16 @@ final class EnhancedPlaybackSession: Sendable {
     ///   - externalSubtitles: Fetched while the file is probed. One that fails is logged and left out.
     ///   - trickplay: Sprite sheets of thumbnails, served as the master's I-frame rendition.
     ///     Left out, logged, when its description doesn't add up.
-    static func start(url: URL, configuration: EnhancedPlayerConfiguration = .init(), externalSubtitles: [ExternalSubtitle] = [], trickplay: Trickplay? = nil) async throws -> EnhancedPlaybackSession {
-        let logger = Logger.player
+    ///   - logger: The session's logger, carrying its `session` ID. Nil makes one from the
+    ///     configuration's logger with a new ID.
+    static func start(url: URL, configuration: EnhancedPlayerConfiguration = .init(), externalSubtitles: [ExternalSubtitle] = [], trickplay: Trickplay? = nil, logger: Logger? = nil) async throws -> EnhancedPlaybackSession {
+        let logger = logger ?? {
+            var logger = configuration.logger ?? .systemDefault
+            logger[metadataKey: LogMetadata.session] = .string(LogMetadata.newSessionID())
+            return logger
+        }()
+        FFmpegLog.route(to: logger)
+        logger.category(.player).notice("\(SessionDescription.environment(configuration: configuration))")
         let started = Date()
 
         let base = configuration.cacheDirectory
@@ -73,7 +85,7 @@ final class EnhancedPlaybackSession: Sendable {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
 
         let headers = configuration.httpHeaders
-        let externalTask = Task { await loadExternalSubtitles(externalSubtitles, headers: headers, logger: logger) }
+        let externalTask = Task { await loadExternalSubtitles(externalSubtitles, headers: headers, logger: logger.category(.subtitles)) }
         defer { externalTask.cancel() }
 
         let token = CancellationToken()
@@ -84,7 +96,7 @@ final class EnhancedPlaybackSession: Sendable {
                 headers: configuration.httpHeaders,
                 directory: directory.appendingPathComponent("source", isDirectory: true),
                 diskBudget: configuration.sourceCacheBytes,
-                logger: logger
+                logger: logger.category(.source)
             )
         } catch {
             try? FileManager.default.removeItem(at: directory)
@@ -113,10 +125,12 @@ final class EnhancedPlaybackSession: Sendable {
                     duration: plan.segments.reduce(0) { $0 + $1.duration },
                     originSeconds: Double(context.originTicks) / 10_000_000,
                     headers: headers,
-                    logger: logger
+                    logger: logger.category(.trickplay)
                 )
             }
-            logger.info("Probed \(media.formatName) in \(String(format: "%.0f", Date().timeIntervalSince(started) * 1000)) ms: \(media.keyframes.timestamps.count) keyframes, \(plan.count) segments, \(media.audio.count) audio tracks, \(media.subtitles.count) subtitle tracks")
+            let player = logger.category(.player)
+            player.notice("Probed in \(String(format: "%.0f", Date().timeIntervalSince(started) * 1000)) ms: \(media.keyframes.timestamps.count) keyframes, \(plan.count) segments")
+            for line in SessionDescription.media(media, file: url) { player.notice("\(line)") }
             core = PlaybackSessionCore(
                 context: context,
                 directory: directory,
@@ -131,12 +145,12 @@ final class EnhancedPlaybackSession: Sendable {
             throw error
         }
 
-        let server = HLSServer(session: core, logger: logger)
+        let server = HLSServer(session: core, logger: logger.category(.server))
         do {
             let port = try await server.start()
             let master = URL(string: "http://127.0.0.1:\(port)/master.m3u8")!
-            logger.info("Serving \(master.absoluteString)")
-            return EnhancedPlaybackSession(masterPlaylistURL: master, core: core, server: server)
+            logger.category(.server).info("Serving \(master.absoluteString)")
+            return EnhancedPlaybackSession(masterPlaylistURL: master, core: core, server: server, logger: logger)
         } catch {
             await server.stop()
             core.shutdown()
@@ -332,7 +346,7 @@ final class EnhancedPlaybackSession: Sendable {
     /// It stops reading when the session stops or `token` is cancelled.
     func makeVideoDecoder(token: CancellationToken) throws -> RenderedVideoDecoder {
         let context = core.context
-        return try RenderedVideoDecoder(file: context.file, media: context.media, originTicks: context.originTicks, token: token)
+        return try RenderedVideoDecoder(file: context.file, media: context.media, originTicks: context.originTicks, token: token, logger: logger.category(.video))
     }
 
     /// Holds the first video segment of a seek until the player has decoded its frame; nil
@@ -400,6 +414,7 @@ final class PlaybackSessionCore: Sendable {
     /// Set by the first request for a video init or segment, of either master.
     private let videoRequested = Mutex(false)
     let iFramePlaylistWithheld = Mutex(false)
+    /// The `server` category: what goes wrong answering a request.
     private let logger: Logger
 
     /// How long `iframe.m3u8` waits for a video request before it is withheld.
@@ -409,7 +424,7 @@ final class PlaybackSessionCore: Sendable {
         self.context = context
         self.directory = directory
         self.externalFonts = externalFonts
-        self.logger = logger
+        self.logger = logger.category(.server)
         self.videoGate = context.media.video.rendered == nil ? nil : VideoStartGate()
         var playlists = PlaylistBuilder(media: context.media, plan: context.plan, subtitleGrid: context.subtitleGrid)
         playlists.trickplay = trickplay
@@ -422,7 +437,7 @@ final class PlaybackSessionCore: Sendable {
             segmentCount: context.plan.count,
             segmentsAhead: segmentsAhead,
             token: context.token,
-            logger: logger,
+            logger: logger.category(.remux),
             fileName: { segment, _ in "video_\(segment).mp4" },
             producer: { _ -> SegmentProducer in
                 context.media.video.rendered == nil ? VideoProducer(context: context) : PlaceholderVideoProducer(context: context)
@@ -434,7 +449,7 @@ final class PlaybackSessionCore: Sendable {
             segmentCount: context.plan.count,
             segmentsAhead: segmentsAhead,
             token: context.token,
-            logger: logger,
+            logger: logger.category(.remux),
             fileName: { segment, _ in "video_sdr_\(segment).mp4" },
             producer: { _ -> SegmentProducer in
                 context.media.video.rendered == nil ? VideoProducer(context: context, rewriter: context.sdrRewriter) : PlaceholderVideoProducer(context: context, sdr: true)
@@ -446,7 +461,7 @@ final class PlaybackSessionCore: Sendable {
             segmentCount: context.plan.count,
             segmentsAhead: segmentsAhead,
             token: context.token,
-            logger: logger,
+            logger: logger.category(.remux),
             fileName: { segment, track in "audio_\(track)_\(segment).mp4" },
             producer: { track in
                 let audio = context.media.audio[track]
@@ -481,7 +496,7 @@ final class PlaybackSessionCore: Sendable {
                 let logger = logger
                 return .mp4(try await inits.data(for: "video") {
                     let data = try InitSegmentBuilder.video(context, token: token)
-                    logger.info("init_video.mp4: \(InitSegmentBuilder.describeVideo(data))")
+                    logger.category(.remux).info("init_video.mp4: \(InitSegmentBuilder.describeVideo(data))")
                     return data
                 }, audio: false)
             case .audioInit(let track):

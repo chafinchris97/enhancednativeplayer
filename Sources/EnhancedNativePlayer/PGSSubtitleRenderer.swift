@@ -19,6 +19,7 @@ import UIKit
 @MainActor
 final class PGSSubtitleRenderer {
     private let session: EnhancedPlaybackSession
+    private let logger: Logger
     private let overlay = PGSOverlayView()
     private weak var player: AVPlayer?
     private var timeObserver: Any?
@@ -30,6 +31,7 @@ final class PGSSubtitleRenderer {
 
     init(session: EnhancedPlaybackSession, container: UIView) {
         self.session = session
+        logger = session.logger.category(.subtitles)
         overlay.frame = container.bounds
         overlay.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         overlay.isUserInteractionEnabled = false
@@ -63,7 +65,7 @@ final class PGSSubtitleRenderer {
             // The group only exists once the master playlist has been read.
             guard let group = try? await item.asset.loadMediaSelectionGroup(for: .legible), let self, self.player?.currentItem === item else { return }
             let option = item.currentMediaSelection.selectedMediaOption(in: group)
-            Logger.player.info("Subtitle selection: \(option?.displayName ?? "none")")
+            logger.info("Subtitle selection: \(option?.displayName ?? "none")")
             self.select(track: option?.renditionName.flatMap { self.session.pgsTrack(named: $0) })
         }
     }
@@ -103,7 +105,7 @@ final class PGSSubtitleRenderer {
     private func load(track: Int, segment: Int) {
         framesSegment = segment
         loadTask?.cancel()
-        loadTask = Task { [weak self, session] in
+        loadTask = Task { [weak self, session, logger] in
             do {
                 let frames = try await session.pgsFrames(track: track, segment: segment)
                 guard let self, !Task.isCancelled else { return }
@@ -111,7 +113,7 @@ final class PGSSubtitleRenderer {
                 if let time = self.player?.currentTime() { self.update(at: time) }
             } catch {
                 if !(error is CancellationError) {
-                    Logger.player.warning("PGS segment \(segment) of track \(track) not read: \(error)")
+                    logger.warning("PGS segment \(segment) of track \(track) not read: \(error)")
                 }
                 return
             }

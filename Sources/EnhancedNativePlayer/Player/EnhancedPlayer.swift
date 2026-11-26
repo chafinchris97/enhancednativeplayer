@@ -98,6 +98,10 @@ public final class EnhancedPlayer {
     private var subtitleSelection: MediaTrack?
 
     private let configuration: EnhancedPlayerConfiguration
+    /// The configuration's logger, with the current session's ID once one starts.
+    @ObservationIgnored private var logger: Logger
+    /// App, thermal and audio session events, observed while a session runs.
+    @ObservationIgnored private var sessionObservers: [NSObjectProtocol] = []
     /// For `deinit`, which can't reach the main actor's state.
     private let sessionForCleanup = Mutex<EnhancedPlaybackSession?>(nil)
 
@@ -144,6 +148,7 @@ public final class EnhancedPlayer {
     /// - Parameter configuration: Engine tuning, the same for everything this player loads.
     public init(configuration: EnhancedPlayerConfiguration = EnhancedPlayerConfiguration()) {
         self.configuration = configuration
+        self.logger = configuration.logger ?? .systemDefault
         // AVPlayer's automatic selection criteria stay on: with them off, AVKit's subtitles switch
         // stays off once the user turns subtitles off in its menu, whatever is selected after.
     }
@@ -153,6 +158,10 @@ public final class EnhancedPlayer {
         if let session = sessionForCleanup.withLock({ $0 }) {
             Task { await session.stop() }
         }
+    }
+
+    private func log(_ category: LogCategory) -> Logger {
+        logger.category(category)
     }
 
     // MARK: Loading
@@ -240,11 +249,13 @@ public final class EnhancedPlayer {
 
     /// Starts or resumes playback. Before the file is open, playback starts as soon as it can.
     public func play() {
+        log(.player).info("play()")
         wantsToPlay = true
         if isReady { avPlayer.play() }
     }
 
     public func pause() {
+        log(.player).info("pause() at \(String(format: "%.1f", currentTime.timeInterval)) s")
         wantsToPlay = false
         if isReady { avPlayer.pause() }
         if status == .loading, !isReady { return }
@@ -253,6 +264,7 @@ public final class EnhancedPlayer {
 
     /// Jumps to `time` in the file's timeline. Before playback starts, sets where it starts.
     public func seek(to time: Duration) {
+        log(.player).info("seek(to: \(String(format: "%.3f", time.timeInterval)) s) from \(String(format: "%.1f", currentTime.timeInterval)) s")
         currentTime = time
         let seconds = time.timeInterval
         guard isReady, let session else {
@@ -267,6 +279,7 @@ public final class EnhancedPlayer {
     /// Ends playback now: the server stops, the cache is deleted and the display mode is reset.
     /// Showing the view again starts a new session from the same position.
     public func stop() {
+        log(.player).info("stop()")
         teardown()
     }
 
@@ -278,7 +291,7 @@ public final class EnhancedPlayer {
         if chapters.contains(where: { abs(max(0, $0.start.timeInterval - session.originSeconds) - target.seconds) < 0.05 }) { return target }
         func ticks(_ time: CMTime) -> Int64 { CMTimeConvertScale(time, timescale: 10_000_000, method: .roundHalfAwayFromZero).value }
         guard let landing = session.keyframeLanding(target: ticks(target), current: ticks(old)) else { return target }
-        Logger.player.info("Seek to \(String(format: "%.3f", target.seconds)) s lands on the keyframe at \(String(format: "%.3f", Double(landing) / 1e7)) s")
+        log(.player).info("Seek to \(String(format: "%.3f", target.seconds)) s lands on the keyframe at \(String(format: "%.3f", Double(landing) / 1e7)) s")
         return CMTime(value: landing, timescale: 10_000_000)
     }
 
@@ -286,11 +299,11 @@ public final class EnhancedPlayer {
 
     private func selectAudio(_ track: MediaTrack?) {
         guard let track else {
-            Logger.player.warning("Audio can't be turned off; keeping the current track")
+            log(.player).warning("Audio can't be turned off; keeping the current track")
             return
         }
         guard audioTracks.contains(track) else {
-            Logger.player.warning("Audio track \(track.index) (\(track.name)) is not one of the loaded media's tracks")
+            log(.player).warning("Audio track \(track.index) (\(track.name)) is not one of the loaded media's tracks")
             return
         }
         audioSelection = track
@@ -305,7 +318,7 @@ public final class EnhancedPlayer {
 
     private func selectSubtitle(_ track: MediaTrack?) {
         if let track, !subtitleTracks.contains(track) {
-            Logger.player.warning("Subtitle track \(track.index) (\(track.name)) is not one of the loaded media's tracks")
+            log(.player).warning("Subtitle track \(track.index) (\(track.name)) is not one of the loaded media's tracks")
             return
         }
         subtitleSelection = track
@@ -332,7 +345,7 @@ public final class EnhancedPlayer {
         guard let group = try? await item.asset.loadMediaSelectionGroup(for: characteristic), self.item === item else { return }
         let option = name.flatMap { name in group.options.first { $0.renditionName == name } }
         if name != nil, option == nil {
-            Logger.player.warning("No rendition named \(name!)")
+            log(.player).warning("No rendition named \(name!)")
             return
         }
         item.select(option, in: group)
@@ -413,7 +426,8 @@ public final class EnhancedPlayer {
             if let result {
                 self.artworkCache[artwork] = result
             } else {
-                Logger.player.warning("Artwork not loaded: \(url.absoluteString)")
+                // Without the query, which can carry a token.
+                log(.player).warning("Artwork not loaded: \(url.host ?? "")\(url.path)")
                 self.failedArtwork.insert(artwork)
             }
             if let item = self.item { self.applyPresentation(to: item) }
@@ -455,13 +469,16 @@ public final class EnhancedPlayer {
         guard let media = currentMedia else { return }
         status = .loading
         error = nil
-        Logger.player.info("Opening \(media.url.lastPathComponent)")
+        logger[metadataKey: LogMetadata.session] = .string(LogMetadata.newSessionID())
+        log(.player).notice("Opening \(media.url.lastPathComponent)\(startPosition.map { String(format: " at %.1f s", $0) } ?? "")")
+        observeSessionEvents()
         var configuration = configuration
         configuration.httpHeaders.merge(media.headers) { _, media in media }
         let generation = loadGeneration
+        let logger = logger
         startTask = Task { [weak self, configuration] in
             do {
-                let session = try await EnhancedPlaybackSession.start(url: media.url, configuration: configuration, externalSubtitles: media.subtitles, trickplay: media.trickplay)
+                let session = try await EnhancedPlaybackSession.start(url: media.url, configuration: configuration, externalSubtitles: media.subtitles, trickplay: media.trickplay, logger: logger)
                 guard let self, !Task.isCancelled else {
                     await session.stop()
                     return
@@ -471,11 +488,11 @@ public final class EnhancedPlayer {
                 self.sessionDidOpen(session)
                 try await self.matchDisplay(to: session)
                 guard !Task.isCancelled, self.session === session else { return }
-                Logger.player.info("Display ready, starting AVPlayer")
+                log(.display).info("Display ready, starting AVPlayer")
                 self.activateAudioSession()
                 self.begin(session, master: session.masterPlaylistURL)
             } catch {
-                Logger.player.error("Playback did not start: \(error)")
+                if !(error is CancellationError) { logger.category(.player).error("Playback did not start: \(error)") }
                 guard let self, !Task.isCancelled, !(error is CancellationError) else { return }
                 self.fail(error)
                 self.failWaiters(error) { $0 == generation }
@@ -490,11 +507,11 @@ public final class EnhancedPlayer {
         subtitleTracks = session.subtitleTracks
         // A selection kept from an earlier session of this media, by index.
         if let audio = startSelection.audio, !session.audioTracks.indices.contains(audio) {
-            Logger.player.warning("Audio track \(audio) does not exist (\(session.audioTracks.count) tracks); starting with the default")
+            log(.player).warning("Audio track \(audio) does not exist (\(session.audioTracks.count) tracks); starting with the default")
             startSelection.audio = nil
         }
         if case .track(let subtitle) = startSelection.subtitle, !session.subtitleTracks.indices.contains(subtitle) {
-            Logger.player.warning("Subtitle track \(subtitle) does not exist (\(session.subtitleTracks.count) tracks); starting with the default")
+            log(.player).warning("Subtitle track \(subtitle) does not exist (\(session.subtitleTracks.count) tracks); starting with the default")
             startSelection.subtitle = nil
         }
         session.setStartSelection(startSelection)
@@ -533,6 +550,9 @@ public final class EnhancedPlayer {
         playsSDRMaster = false
         forcedSubtitles?.stop()
         forcedSubtitles = nil
+        if let item { logSummary(of: item) }
+        sessionObservers.forEach { NotificationCenter.default.removeObserver($0) }
+        sessionObservers = []
         avPlayer.pause()
         avPlayer.replaceCurrentItem(with: nil)
         item = nil
@@ -560,7 +580,7 @@ public final class EnhancedPlayer {
         guard let manager = displayManager else { return }
         displayManager = nil
         let window = host?.view.window
-        Logger.player.info("Resetting the display criteria (switched: \(didSwitchDisplay), window: \(window != nil))")
+        log(.display).info("Resetting the display criteria (switched: \(didSwitchDisplay), window: \(window != nil))")
         guard didSwitchDisplay, let window else {
             didSwitchDisplay = false
             manager.preferredDisplayCriteria = nil
@@ -577,7 +597,7 @@ public final class EnhancedPlayer {
         Task { @MainActor in
             let outcome = try? await DisplayModeSwitch.wait(events: { recorder.events }, startTimeout: .seconds(3), switchTimeout: .seconds(10))
             let seen = recorder.events.map { "\($0)" }.joined(separator: ", ")
-            Logger.player.info("Display reset: \(outcome.map { "\($0)" } ?? "cancelled") (\(seen)), removing the cover")
+            log(.display).info("Display reset: \(outcome.map { "\($0)" } ?? "cancelled") (\(seen)), removing the cover")
             recorder.invalidate()
             cover.removeFromSuperview()
         }
@@ -593,25 +613,27 @@ public final class EnhancedPlayer {
         guard let criteria = try? await AVURLAsset(url: session.masterPlaylistURL).load(.preferredDisplayCriteria), self.session === session else { return }
         displayManager = manager
         guard manager.isDisplayCriteriaMatchingEnabled else {
+            // Without it the display stays in its mode: other frame rates judder, HDR may not switch.
+            log(.display).notice("Match Content is off in Settings; no display mode switch, screen at \(UIScreen.main.maximumFramesPerSecond) fps")
             manager.preferredDisplayCriteria = criteria
             return
         }
         if manager.isDisplayModeSwitchInProgress {
             // Nothing has been asked for yet, so this is AVKit's stale count (see DisplayModeSwitch).
-            Logger.player.notice("isDisplayModeSwitchInProgress is already true before any switch was requested; following the switch notifications instead")
+            log(.display).notice("isDisplayModeSwitchInProgress is already true before any switch was requested; following the switch notifications instead")
         }
         // Recording starts before the request so a quick switch's start is not missed.
         let recorder = DisplayModeSwitchRecorder()
         defer { recorder.invalidate() }
         manager.preferredDisplayCriteria = criteria
-        Logger.player.info("Waiting for the display mode switch")
+        log(.display).info("Waiting for the display mode switch")
         let outcome = try await DisplayModeSwitch.wait(events: { recorder.events })
         let seen = recorder.events.map { "\($0)" }.joined(separator: ", ")
         didSwitchDisplay = outcome != .neverStarted
         switch outcome {
-        case .switched: Logger.player.info("Display mode switch ended (\(seen))")
-        case .neverStarted: Logger.player.info("No display mode switch started")
-        case .neverEnded: Logger.player.warning("Display mode switch did not end within 15 s (\(seen)), starting anyway")
+        case .switched: log(.display).notice("Display mode switch ended (\(seen)); screen at \(UIScreen.main.maximumFramesPerSecond) fps")
+        case .neverStarted: log(.display).notice("No display mode switch started; screen at \(UIScreen.main.maximumFramesPerSecond) fps")
+        case .neverEnded: log(.display).warning("Display mode switch did not end within 15 s (\(seen)), starting anyway")
         }
         #endif
     }
@@ -625,7 +647,7 @@ public final class EnhancedPlayer {
             try audioSession.setActive(true)
             audioSessionActive = true
         } catch {
-            Logger.player.warning("Audio session not activated: \(error)")
+            log(.player).warning("Audio session not activated: \(error)")
         }
     }
 
@@ -720,7 +742,7 @@ public final class EnhancedPlayer {
         guard let host, let overlay = host.playerViewController.contentOverlayView else { return }
         // The SDR master's video is relabeled HDR: shown tone mapped over AVPlayer's picture.
         if playsSDRMaster, let color = session.sdrMasterSourceColor {
-            let renderer = toneMapper ?? ToneMappedVideoRenderer(color: color, playerView: host.playerViewController.view, container: overlay)
+            let renderer = toneMapper ?? ToneMappedVideoRenderer(color: color, playerView: host.playerViewController.view, container: overlay, logger: log(.video))
             toneMapper = renderer
             renderer.attach(item: item)
         } else {
@@ -747,9 +769,10 @@ public final class EnhancedPlayer {
 
     private func observe(_ item: AVPlayerItem, session: EnhancedPlaybackSession, master: URL) {
         // What AVPlayer itself reports while loading: the server only sees what it asks for.
+        let avLogger = log(.avplayer)
         waitingObservation = avPlayer.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
-            let reason = player.reasonForWaitingToPlay?.rawValue ?? "none"
-            Logger.player.info("AVPlayer timeControlStatus \(player.timeControlStatus.rawValue), waiting reason \(reason)")
+            let reason = player.reasonForWaitingToPlay.map { ", waiting: \($0.rawValue)" } ?? ""
+            avLogger.info("AVPlayer \(player.timeControlStatus.logName)\(reason)")
             let playing = player.timeControlStatus == .playing
             Task { @MainActor [weak self] in
                 self?.updateStatus()
@@ -759,7 +782,7 @@ public final class EnhancedPlayer {
         itemObservations.append(item.observe(\.status, options: [.new]) { [weak self] item, _ in
             Task { @MainActor [weak self] in
                 guard let self, self.item === item else { return }
-                Logger.player.info("AVPlayerItem status \(item.status.rawValue)\(item.error.map { ": \($0)" } ?? "")")
+                self.log(.avplayer).log(level: item.status == .failed ? .error : .info, "AVPlayerItem \(item.status.logName)\(item.error.map { ": \($0)" } ?? "")")
                 switch item.status {
                 case .readyToPlay:
                     self.logVideoFormat(item, when: "ready")
@@ -770,7 +793,7 @@ public final class EnhancedPlayer {
                     guard let error = item.error else { return }
                     if master == session.masterPlaylistURL, let sdrMaster = session.sdrMasterPlaylistURL, DisplayRefusal.matches(error, iFramePlaylistWithheld: session.iFramePlaylistWithheld) {
                         let nsError = error as NSError
-                        Logger.player.info("HDR master refused (\(nsError.domain) \(nsError.code)), playing the SDR master")
+                        self.log(.avplayer).notice("HDR master refused (\(nsError.domain) \(nsError.code)), playing the SDR master")
                         self.begin(session, master: sdrMaster)
                     } else {
                         self.fail(error)
@@ -788,9 +811,16 @@ public final class EnhancedPlayer {
         itemObservers.append(center.addObserver(forName: AVPlayerItem.timeJumpedNotification, object: item, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.logVideoFormat(item, when: "time jumped") }
         })
+        itemObservers.append(center.addObserver(forName: AVPlayerItem.playbackStalledNotification, object: item, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.log(.avplayer).warning("Playback stalled at \(String(format: "%.1f", self.currentTime.timeInterval)) s: AVPlayer ran out of loaded media")
+            }
+        })
+        let errorLogger = log(.avplayer)
         itemObservers.append(center.addObserver(forName: AVPlayerItem.newErrorLogEntryNotification, object: item, queue: .main) { _ in
             guard let event = item.errorLog()?.events.last else { return }
-            Logger.player.warning("AVPlayer error log: \(event.errorDomain) \(event.errorStatusCode) \(event.errorComment ?? "") \(event.uri ?? "")")
+            errorLogger.warning("AVPlayer error log: \(event.errorDomain) \(event.errorStatusCode) \(event.errorComment ?? "") \(event.uri ?? "")")
         })
         itemObservers.append(center.addObserver(forName: AVPlayerItem.didPlayToEndTimeNotification, object: item, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.status = .ended }
@@ -834,7 +864,8 @@ public final class EnhancedPlayer {
                     lines.append("variant: codecs \(codecs), range \(video?.videoRange.rawValue ?? "none")")
                 }
             }
-            Logger.player.info("Video format (\(moment)): \(lines.joined(separator: "; "))")
+            // Ready says what AVPlayer took; the rest repeats it on every seek and resume.
+            self.log(.avplayer).log(level: moment == "ready" ? .info : .debug, "Video format (\(moment)): \(lines.joined(separator: "; "))")
         }
     }
 
@@ -844,6 +875,55 @@ public final class EnhancedPlayer {
         itemObservers = []
         if let timeObserver { avPlayer.removeTimeObserver(timeObserver) }
         timeObserver = nil
+    }
+
+    /// What AVPlayer measured over the item, from its access log: one line for the whole item.
+    private func logSummary(of item: AVPlayerItem) {
+        guard let events = item.accessLog()?.events, !events.isEmpty else { return }
+        let watched = events.reduce(0) { $0 + max(0, $1.durationWatched) }
+        let stalls = events.reduce(0) { $0 + max(0, $1.numberOfStalls) }
+        let dropped = events.reduce(0) { $0 + max(0, $1.numberOfDroppedVideoFrames) }
+        let bytes = events.reduce(Int64(0)) { $0 + max(0, $1.numberOfBytesTransferred) }
+        let startup = events.first.map { $0.startupTime > 0 ? String(format: "%.2f s", $0.startupTime) : "–" } ?? "–"
+        let observed = events.last.map { $0.observedBitrate > 0 ? "\(Int($0.observedBitrate / 1000)) kb/s" : "–" } ?? "–"
+        // AVPlayer's dropped frames are the placeholder's when the engine draws the video; the
+        // engine's own summary lines count those.
+        log(.avplayer).notice("Item summary: watched \(String(format: "%.0f", watched)) s, startup \(startup), \(stalls) stalls, \(dropped) dropped frames\(session?.rendersVideo == true ? " (placeholder)" : ""), \(bytes >> 20) MB from the server at \(observed), ended at \(String(format: "%.1f", currentTime.timeInterval)) s\(playsSDRMaster ? ", SDR master" : "")")
+    }
+
+    /// The app and system around playback: backgrounding, memory, heat, and the audio route.
+    private func observeSessionEvents() {
+        sessionObservers.forEach { NotificationCenter.default.removeObserver($0) }
+        let center = NotificationCenter.default
+        let logger = log(.player)
+        sessionObservers = [
+            center.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { _ in
+                logger.info("App entered the background")
+            },
+            center.addObserver(forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main) { _ in
+                logger.info("App entering the foreground")
+            },
+            center.addObserver(forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: .main) { _ in
+                logger.warning("Memory warning")
+            },
+            center.addObserver(forName: ProcessInfo.thermalStateDidChangeNotification, object: nil, queue: .main) { _ in
+                let state = ProcessInfo.processInfo.thermalState
+                logger.log(level: state.rawValue >= ProcessInfo.ThermalState.serious.rawValue ? .warning : .notice, "Thermal state \(state.logName)")
+            },
+            center.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { notification in
+                let type = (notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt).flatMap(AVAudioSession.InterruptionType.init)
+                logger.notice("Audio session interruption \(type == .began ? "began" : type == .ended ? "ended" : "of unknown type")")
+            },
+            center.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main) { notification in
+                let reason = (notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt).flatMap(AVAudioSession.RouteChangeReason.init)
+                // Category changes come with every activation and say nothing about the route.
+                guard let reason, reason != .categoryChange else { return }
+                let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
+                    .map { "\($0.portType.rawValue) \($0.portName)\($0.channels.map { ", \($0.count) ch" } ?? "")" }
+                    .joined(separator: "; ")
+                logger.notice("Audio route changed (reason \(reason.rawValue)): \(outputs.isEmpty ? "no output" : outputs)")
+            },
+        ]
     }
 
     private func updateStatus() {
@@ -863,12 +943,18 @@ public final class EnhancedPlayer {
                   self.item === item
             else { return }
             let selection = item.currentMediaSelection
+            let before = (audioSelection, subtitleSelection)
             if let name = selection.selectedMediaOption(in: audible)?.renditionName, let index = session.audioTrackNames.firstIndex(of: name) {
                 audioSelection = session.audioTracks[index]
             }
             subtitleSelection = selection.selectedMediaOption(in: legible)?.renditionName
                 .flatMap { session.subtitleTrackNames.firstIndex(of: $0) }
                 .map { session.subtitleTracks[$0] }
+            if before.0 != audioSelection || before.1 != subtitleSelection {
+                let audio = audioSelection.map { "\($0.index) (\($0.name))" } ?? "none"
+                let subtitle = subtitleSelection.map { "\($0.index) (\($0.name))" } ?? "off"
+                log(.player).info("Playing audio \(audio), subtitles \(subtitle)")
+            }
         }
     }
 }
@@ -913,6 +999,27 @@ enum MetadataItems {
         item.dataType = (data.starts(with: [0x89, 0x50, 0x4E, 0x47]) ? kCMMetadataBaseDataType_PNG : kCMMetadataBaseDataType_JPEG) as String
         item.extendedLanguageTag = "und"
         return item.copy() as! AVMetadataItem
+    }
+}
+extension AVPlayer.TimeControlStatus {
+    var logName: String {
+        switch self {
+        case .paused: "paused"
+        case .waitingToPlayAtSpecifiedRate: "waiting to play"
+        case .playing: "playing"
+        @unknown default: "status \(rawValue)"
+        }
+    }
+}
+
+extension AVPlayerItem.Status {
+    var logName: String {
+        switch self {
+        case .unknown: "unknown"
+        case .readyToPlay: "ready to play"
+        case .failed: "failed"
+        @unknown default: "status \(rawValue)"
+        }
     }
 }
 #endif
