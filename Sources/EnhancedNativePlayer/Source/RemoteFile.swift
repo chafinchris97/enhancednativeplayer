@@ -3,12 +3,17 @@ import Logging
 
 /// Random access to a remote file through HTTP range requests.
 ///
-/// The file is fetched in fixed-size blocks that are shared by every reader of the
-/// session: the probe, the video remux, the audio remux and the init builders all
-/// demux the same interleaved bytes, so a block fetched for one is a cache hit for
-/// the others. Recent blocks stay in memory; older ones spill to disk up to a byte
-/// budget, which is what lets the audio remux trail the video remux by a few
-/// segments without downloading the file twice.
+/// The file is read in fixed-size blocks that are shared by every reader of the session:
+/// the probe, the video remux, the audio remux and the init builders all demux the same
+/// interleaved bytes, so a block fetched for one is a cache hit for the others. Recent
+/// blocks stay in memory; older ones spill to disk up to a byte budget, which is what lets
+/// the audio remux trail the video remux by a few segments without downloading the file twice.
+///
+/// Blocks arrive through a few sequential streams rather than one request each, the way
+/// a media player reads a file: a stream starts where a reader asked, reads ahead of the
+/// furthest block asked of it in requests that grow from a couple of blocks (a probe's
+/// jump) to many (playback), and pauses once it is far enough ahead. Hosts that ration
+/// connections, as CDNs often do, refuse a client that opens many short ones.
 final class RemoteFile: @unchecked Sendable {
     let url: URL
     let length: Int64
@@ -20,16 +25,56 @@ final class RemoteFile: @unchecked Sendable {
     private let logger: Logger
     private let maxDiskBlocks: Int
     private let maxMemoryBlocks = 16
-    private let maxConcurrentFetches = 6
+    /// Streams, and so connections to the source, open at once.
+    static let maxStreams = 2
+    /// How far a stream reads past the furthest block asked of it before pausing.
+    private let readAhead = 32
+    /// A block this close past a stream's frontier is waited for instead of opening another stream.
+    private let reach = 8
+    /// Blocks in a stream's first request, and the most in one; each request doubles the last.
+    private let firstChunk = 2
+    private let maxChunk = 32
+    /// A failed stream is retried while a reader waits on it or asked of it this recently.
+    private let wantedFor = Duration.seconds(10)
 
     private let condition = NSCondition()
     private var memory: [Int: Data] = [:]
     private var memoryOrder: [Int] = []
     private var disk: [Int: UInt64] = [:]
     private var useClock: UInt64 = 0
-    private var inflight: [Int: URLSessionDataTask] = [:]
     private var failures: [Int: Error] = [:]
+    private var streams: [Stream] = []
+    private var tasks: [Int: Stream] = [:]
     private var closed = false
+
+    /// One sequential read of the file, a request at a time.
+    /// Guarded by `condition`, like the rest of the file's state.
+    private final class Stream: @unchecked Sendable {
+        /// The next block it delivers.
+        var frontier: Int
+        /// The furthest block asked of it.
+        var demand: Int
+        var lastUse: ContinuousClock.Instant
+        var waiters = 0
+        var task: URLSessionDataTask?
+        /// The block the current request ends before.
+        var end = 0
+        var partial = Data()
+        var failedStatus: Int?
+        var chunk: Int
+        var attempt = 0
+        var backingOff = false
+        var cancelled = false
+
+        init(at index: Int, chunk: Int) {
+            frontier = index
+            demand = index
+            lastUse = .now
+            self.chunk = chunk
+        }
+
+        var busy: Bool { task != nil || backingOff }
+    }
 
     private init(url: URL, length: Int64, blockSize: Int, session: URLSession, headers: [String: String], directory: URL, diskBudget: Int64, logger: Logger) {
         self.url = url
@@ -48,26 +93,43 @@ final class RemoteFile: @unchecked Sendable {
     static func open(url: URL, headers: [String: String], directory: URL, blockSize: Int = 1 << 20, diskBudget: Int64, logger: Logger) async throws -> RemoteFile {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let configuration = URLSessionConfiguration.default
-        configuration.httpMaximumConnectionsPerHost = 6
+        configuration.httpMaximumConnectionsPerHost = maxStreams
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
         configuration.urlCache = nil
         configuration.timeoutIntervalForRequest = 30
-        let session = URLSession(configuration: configuration)
+        let delegate = SessionDelegate()
+        let queue = OperationQueue()
+        queue.maxConcurrentOperationCount = 1
+        queue.name = "ENP.source"
+        let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: queue)
 
         var request = URLRequest(url: url)
         for (key, value) in headers { request.setValue(value, forHTTPHeaderField: key) }
         request.setValue("bytes=0-\(blockSize - 1)", forHTTPHeaderField: "Range")
-        let (data, response) = try await session.data(for: request)
-        guard let http = response as? HTTPURLResponse else { throw EnhancedPlayerError.network("not an HTTP response") }
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch {
+            session.invalidateAndCancel()
+            throw error
+        }
+        guard let http = response as? HTTPURLResponse else {
+            session.invalidateAndCancel()
+            throw EnhancedPlayerError.network("not an HTTP response")
+        }
         guard http.statusCode == 206 else {
+            session.invalidateAndCancel()
             if (200..<300).contains(http.statusCode) { throw EnhancedPlayerError.rangeRequestsUnsupported(url) }
             throw EnhancedPlayerError.http(status: http.statusCode, url: url)
         }
         guard let range = http.value(forHTTPHeaderField: "Content-Range"),
               let total = range.split(separator: "/").last.flatMap({ Int64($0) }) else {
+            session.invalidateAndCancel()
             throw EnhancedPlayerError.rangeRequestsUnsupported(url)
         }
         let file = RemoteFile(url: url, length: total, blockSize: blockSize, session: session, headers: headers, directory: directory, diskBudget: diskBudget, logger: logger)
+        delegate.file = file
         file.seed(data)
         return file
     }
@@ -83,10 +145,16 @@ final class RemoteFile: @unchecked Sendable {
         let asked = ContinuousClock.now
         /// Why the block wasn't in memory, for the slow-read log.
         var missed: String?
+        /// The stream this reader waits on.
+        var waitingOn: Stream?
         condition.lock()
-        defer { condition.unlock() }
+        defer {
+            waitingOn?.waiters -= 1
+            condition.unlock()
+        }
         while true {
             if closed || token.isCancelled { throw EnhancedPlayerError.cancelled }
+            touch(index)
             if let data = memory[index] {
                 touchMemory(index)
                 logIfSlow(index, since: asked, missed)
@@ -104,12 +172,22 @@ final class RemoteFile: @unchecked Sendable {
                 disk[index] = nil
             }
             if let error = failures.removeValue(forKey: index) { throw error }
-            if missed == nil {
-                missed = inflight[index] == nil
-                    ? "not cached or prefetched, fetched on demand with \(inflight.count) other fetches in flight"
-                    : "its prefetch was still in flight (\(inflight.count) fetches in flight)"
+            let stream: Stream
+            if let reaching = streams.first(where: { index >= $0.frontier && index <= $0.frontier + reach }) {
+                stream = reaching
+                if missed == nil {
+                    missed = "waited on the stream \(index - reaching.frontier) blocks short of it (\(streams.count) open)"
+                }
+            } else {
+                stream = openStream(at: index)
+                if missed == nil { missed = "no stream was reading near it, opened one (\(streams.count) open)" }
             }
-            if inflight[index] == nil { startFetch(index, attempt: 0) }
+            if stream !== waitingOn {
+                waitingOn?.waiters -= 1
+                stream.waiters += 1
+                waitingOn = stream
+            }
+            pump(stream)
             _ = condition.wait(until: Date().addingTimeInterval(0.2))
         }
     }
@@ -131,75 +209,157 @@ final class RemoteFile: @unchecked Sendable {
         return String(format: "%.1f ms", Double(seconds) * 1000 + Double(attoseconds) / 1e15)
     }
 
-    /// Starts background fetches for blocks that are not cached yet.
-    func prefetch(_ indices: Range<Int>) {
-        condition.lock()
-        defer { condition.unlock() }
-        guard !closed else { return }
-        for index in indices where index >= 0 && index < blockCount {
-            if inflight.count >= maxConcurrentFetches { break }
-            if memory[index] != nil || disk[index] != nil || inflight[index] != nil { continue }
-            startFetch(index, attempt: 0)
-        }
-    }
-
     func close() {
         condition.lock()
         closed = true
-        let tasks = Array(inflight.values)
-        inflight.removeAll()
+        let open = streams
+        streams.removeAll()
+        tasks.removeAll()
         memory.removeAll()
         memoryOrder.removeAll()
         condition.broadcast()
         condition.unlock()
-        tasks.forEach { $0.cancel() }
+        open.forEach { $0.task?.cancel() }
         session.invalidateAndCancel()
         try? FileManager.default.removeItem(at: directory)
     }
 
-    // MARK: - Private (call with the condition locked)
+    // MARK: - Session callbacks (on the session's serial queue)
 
-    private func startFetch(_ index: Int, attempt: Int) {
-        let start = Int64(index) * Int64(blockSize)
-        let end = min(length, start + Int64(blockSize)) - 1
-        var request = URLRequest(url: url)
-        for (key, value) in headers { request.setValue(value, forHTTPHeaderField: key) }
-        request.setValue("bytes=\(start)-\(end)", forHTTPHeaderField: "Range")
-        let expected = Int(end - start + 1)
-        let task = session.dataTask(with: request) { [weak self] data, response, error in
-            self?.finishFetch(index, attempt: attempt, expected: expected, data: data, response: response, error: error)
+    fileprivate func received(_ response: URLResponse, for task: URLSessionDataTask) -> URLSession.ResponseDisposition {
+        condition.lock()
+        defer { condition.unlock() }
+        guard let stream = tasks[task.taskIdentifier] else { return .allow }
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard status == 206 else {
+            stream.failedStatus = status
+            return .cancel
         }
-        inflight[index] = task
-        task.resume()
+        return .allow
     }
 
-    private func finishFetch(_ index: Int, attempt: Int, expected: Int, data: Data?, response: URLResponse?, error: Error?) {
+    fileprivate func received(_ data: Data, for task: URLSessionDataTask) {
+        condition.lock()
+        defer { condition.unlock() }
+        guard let stream = tasks[task.taskIdentifier], stream.task === task else { return }
+        stream.partial.append(data)
+        stream.attempt = 0
+        var delivered = false
+        while stream.frontier < stream.end {
+            let size = blockLength(stream.frontier)
+            guard stream.partial.count >= size else { break }
+            store(Data(stream.partial.prefix(size)), for: stream.frontier)
+            stream.partial = Data(stream.partial.dropFirst(size))
+            stream.frontier += 1
+            delivered = true
+        }
+        if delivered { condition.broadcast() }
+    }
+
+    fileprivate func completed(_ task: URLSessionTask, error: Error?) {
         condition.lock()
         defer {
             condition.broadcast()
             condition.unlock()
         }
-        guard !closed else { return }
-        inflight[index] = nil
-        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        if let data, error == nil, status == 206, data.count == expected {
-            store(data, for: index)
+        guard let stream = tasks.removeValue(forKey: task.taskIdentifier), stream.task === task else { return }
+        stream.task = nil
+        stream.partial = Data()
+        guard !closed, !stream.cancelled else { return }
+        let status = stream.failedStatus
+        stream.failedStatus = nil
+        if error == nil, status == nil, stream.frontier >= stream.end {
+            stream.chunk = min(maxChunk, stream.chunk * 2)
+            pump(stream)
             return
         }
-        let reason = error.map { $0.localizedDescription } ?? (status != 206 ? "HTTP \(status)" : "\(data?.count ?? 0) of \(expected) bytes")
-        if attempt < 3 {
-            logger.warning("Source block \(index) attempt \(attempt + 1) failed (\(reason)), retrying")
-            startFetch(index, attempt: attempt + 1)
+        let reason = status.map { "HTTP \($0)" }
+            ?? error.map { $0.localizedDescription }
+            ?? "the response ended at block \(stream.frontier) of \(stream.end)"
+        guard stream.waiters > 0 || ContinuousClock.now - stream.lastUse < wantedFor else {
+            // Nobody reads there any more: leave it idle rather than add load to a
+            // struggling server. A reader that comes back restarts it.
+            logger.debug("Source stream at block \(stream.frontier) failed (\(reason)), idle")
             return
         }
-        logger.error("Source block \(index) failed after \(attempt + 1) attempts: \(reason)")
-        if let error {
-            failures[index] = EnhancedPlayerError.network(error.localizedDescription)
-        } else if status != 206 {
-            failures[index] = EnhancedPlayerError.http(status: status, url: url)
-        } else {
-            failures[index] = EnhancedPlayerError.network("short read for block \(index)")
+        // A client error won't clear up by retrying; anything else (a slow or briefly
+        // unreachable server, a timeout, a 5xx) is retried for as long as it's wanted.
+        if let status, (400..<500).contains(status), status != 408, status != 429, stream.attempt >= 3 {
+            logger.error("Source block \(stream.frontier) failed after \(stream.attempt + 1) attempts: \(reason)")
+            failures[stream.frontier] = EnhancedPlayerError.http(status: status, url: url)
+            cancel(stream)
+            return
         }
+        let delay = min(0.5 * Double(1 << min(stream.attempt, 4)), 8)
+        stream.attempt += 1
+        stream.chunk = firstChunk
+        stream.backingOff = true
+        logger.warning("Source stream at block \(stream.frontier) attempt \(stream.attempt) failed (\(reason)), retrying in \(delay) s")
+        DispatchQueue.global().asyncAfter(deadline: .now() + delay) { [weak self, stream] in
+            guard let self else { return }
+            self.condition.lock()
+            defer { self.condition.unlock() }
+            stream.backingOff = false
+            self.pump(stream)
+        }
+    }
+
+    // MARK: - Private (call with the condition locked)
+
+    /// Records that `index` was asked of the streams heading there, which keeps them reading.
+    private func touch(_ index: Int) {
+        for stream in streams where index <= stream.frontier + reach && index >= stream.frontier - readAhead - maxChunk {
+            stream.demand = max(stream.demand, index)
+            stream.lastUse = .now
+            pump(stream)
+        }
+    }
+
+    private func openStream(at index: Int) -> Stream {
+        if streams.count >= Self.maxStreams {
+            let idle = streams.filter { $0.waiters == 0 }
+            if let victim = (idle.isEmpty ? streams : idle).min(by: { $0.lastUse < $1.lastUse }) {
+                cancel(victim)
+            }
+        }
+        let stream = Stream(at: index, chunk: firstChunk)
+        streams.append(stream)
+        logger.debug("Source stream opened at block \(index)")
+        return stream
+    }
+
+    private func cancel(_ stream: Stream) {
+        stream.cancelled = true
+        if let task = stream.task {
+            tasks[task.taskIdentifier] = nil
+            task.cancel()
+        }
+        stream.task = nil
+        streams.removeAll { $0 === stream }
+    }
+
+    /// Starts the stream's next request if it's idle and not far enough ahead yet.
+    private func pump(_ stream: Stream) {
+        guard !closed, !stream.cancelled, !stream.busy else { return }
+        while stream.frontier < blockCount, memory[stream.frontier] != nil || disk[stream.frontier] != nil {
+            stream.frontier += 1
+        }
+        guard stream.frontier < blockCount, stream.frontier <= stream.demand + readAhead else { return }
+        stream.end = min(blockCount, stream.frontier + stream.chunk)
+        let start = Int64(stream.frontier) * Int64(blockSize)
+        let last = min(length, Int64(stream.end) * Int64(blockSize)) - 1
+        var request = URLRequest(url: url)
+        for (key, value) in headers { request.setValue(value, forHTTPHeaderField: key) }
+        request.setValue("bytes=\(start)-\(last)", forHTTPHeaderField: "Range")
+        let task = session.dataTask(with: request)
+        stream.task = task
+        stream.partial = Data()
+        tasks[task.taskIdentifier] = stream
+        task.resume()
+    }
+
+    private func blockLength(_ index: Int) -> Int {
+        Int(min(Int64(blockSize), length - Int64(index) * Int64(blockSize)))
     }
 
     private func store(_ data: Data, for index: Int) {
@@ -239,6 +399,23 @@ final class RemoteFile: @unchecked Sendable {
     }
 }
 
+/// Hands the session's callbacks to its file; the session holds its delegate strongly.
+private final class SessionDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    weak var file: RemoteFile?
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping @Sendable (URLSession.ResponseDisposition) -> Void) {
+        completionHandler(file?.received(response, for: dataTask) ?? .allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        file?.received(data, for: dataTask)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        file?.completed(task, error: error)
+    }
+}
+
 /// One reader's position in a `RemoteFile`, the opaque behind a custom `AVIOContext`.
 final class RemoteCursor {
     let file: RemoteFile
@@ -246,8 +423,6 @@ final class RemoteCursor {
     private(set) var position: Int64 = 0
     private var currentIndex = -1
     private var current = Data()
-    private var lastIndex = Int.min
-    private let readAhead = 8
 
     init(file: RemoteFile, token: CancellationToken) {
         self.file = file
@@ -263,11 +438,6 @@ final class RemoteCursor {
             if index != currentIndex {
                 current = try file.block(index, token: token)
                 currentIndex = index
-                if index == lastIndex + 1 {
-                    // Sequential access: keep the pipe full.
-                    file.prefetch((index + 1)..<(index + 1 + readAhead))
-                }
-                lastIndex = index
             }
         } catch EnhancedPlayerError.cancelled {
             return FF.errorExit
