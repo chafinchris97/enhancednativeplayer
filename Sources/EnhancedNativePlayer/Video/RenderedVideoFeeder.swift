@@ -34,6 +34,13 @@ final class RenderedVideoFeeder: @unchecked Sendable {
     static let slowCatchUp = Duration.seconds(2)
     /// A clock this close to a target the server named has reached it.
     static let arrivedTicks: Int64 = 10_000_000
+    /// A frame on the clock that reaches the renderer less than this ahead of its start is at risk
+    /// of showing late: getting it on screen takes a refresh or two after that. Each one is logged
+    /// at once, and the summary counts them; the two use this one threshold.
+    static let thinLeadTicks: Int64 = 1_000_000
+    /// After a seek the queue builds up from nothing, so frames come thin for a moment: expected,
+    /// and not counted as at risk.
+    static let settling = Duration.seconds(1)
 
     private let renderer: AVSampleBufferVideoRenderer
     private let timebase: CMTimebase
@@ -129,6 +136,11 @@ final class RenderedVideoFeeder: @unchecked Sendable {
         return target
     }
 
+    /// For hitch logs: "12.3 ms", and a playlist time as "2731.042 s".
+    private static func ms(_ duration: Duration) -> String { String(format: "%.1f ms", duration.timeInterval * 1000) }
+    private static func ms(ticks: Int64) -> String { String(format: "%.0f ms", Double(ticks) / 10_000) }
+    private static func seconds(_ ticks: Int64) -> String { String(format: "%.3f s", Double(ticks) / 1e7) }
+
     private func publish(_ queued: [(start: Int64, end: Int64)]) {
         condition.lock()
         queuedSpan = queued.first.map { first in first.start..<max(first.start + 1, queued.last!.end) }
@@ -159,9 +171,21 @@ final class RenderedVideoFeeder: @unchecked Sendable {
         var warnedSlowCatchUp = false
         /// The target of the seek under way, until its first frame is enqueued.
         var seekingTo: Int64?
+        /// Until when the queue is still building up after a catch-up.
+        var settlingUntil = ContinuousClock.now
         var stats = Stats()
+        /// Hitches are logged as they happen, with when and why; a bad stretch logs one a second.
+        let hitches = LogThrottle(interval: .seconds(1))
 
         while true {
+            // Every 30 s while all is well, every 5 s while frames come late or are dropped; checked
+            // on every pass, so a thread that waits for long still reports.
+            let age = ContinuousClock.now - stats.since
+            if age > .seconds(30) || (age > .seconds(5) && stats.isDegraded) {
+                stats.report(codec: decoder.codecName, frameRate: decoder.frameRate, logger: logger)
+                stats = Stats()
+            }
+
             condition.lock()
             if stopped {
                 condition.unlock()
@@ -242,7 +266,8 @@ final class RenderedVideoFeeder: @unchecked Sendable {
                     defer { condition.unlock() }
                     return stopped || jump != nil
                 })
-                stats.add(decoder.takeStageTimes())
+                let times = decoder.takeStageTimes()
+                stats.add(times)
                 // Frames are dropped until one is in time, so a decoder slower than playback never
                 // gets back on the clock and the image stays where the seek left it.
                 if catchingUp, let from = caughtUpFrom, ContinuousClock.now - from > Self.slowCatchUp {
@@ -258,15 +283,29 @@ final class RenderedVideoFeeder: @unchecked Sendable {
                 }
                 let enqueueing = ContinuousClock.now
                 renderer.enqueue(decoded.sample)
-                stats.enqueue += ContinuousClock.now - enqueueing
+                let enqueue = ContinuousClock.now - enqueueing
+                stats.enqueue += enqueue
                 stats.shown += 1
-                if timesOneFrame { stats.worstFrame = max(stats.worstFrame, ContinuousClock.now - started) }
+                let took = ContinuousClock.now - started
+                if timesOneFrame { stats.worstFrame = max(stats.worstFrame, took) }
                 queued.append((decoded.start, decoded.end))
                 publish(queued)
                 seekingTo = nil
                 lastShown = ContinuousClock.now
                 // The frame that ends a catch-up is late by design; only frames on the clock count.
-                if timesOneFrame { stats.record(lead: decoded.start - now) }
+                if timesOneFrame {
+                    let clock = now
+                    let lead = decoded.start - clock
+                    let atRisk = lead < Self.thinLeadTicks && ContinuousClock.now >= settlingUntil
+                    stats.record(lead: lead, atRisk: atRisk)
+                    if atRisk {
+                        hitches.log(logger, .warning, key: "frame") {
+                            let due = lead >= 0 ? "\(Self.ms(ticks: lead)) before it was due" : "\(Self.ms(ticks: -lead)) after it was due"
+                            let frames = times.decoded > 1 ? ", \(times.decoded) frames decoded" : ""
+                            return "Video hitch (may show late): frame at \(Self.seconds(decoded.start)) reached the renderer \(due) (clock at \(Self.seconds(clock))); it took \(Self.ms(took)): read \(Self.ms(times.read)) over \(times.packets) packets, decode \(Self.ms(times.decode))\(frames), convert \(Self.ms(times.convert)), enqueue \(Self.ms(enqueue)); \(queued.count) frames queued, thermal \(ProcessInfo.processInfo.thermalState.logName)"
+                        }
+                    }
+                }
                 if catchingUp, decoded.end > now {
                     catchingUp = false
                     decoder.skipsUnreferencedFrames = false
@@ -274,6 +313,7 @@ final class RenderedVideoFeeder: @unchecked Sendable {
                         logger.info("Video: on the clock \((ContinuousClock.now - from).formatted(.units(allowed: [.milliseconds]))) after the seek")
                     }
                     caughtUpFrom = nil
+                    settlingUntil = .now + Self.settling
                 }
             } catch is RenderedVideoDecoder.Interrupted {
                 // A jump or a stop: the loop takes it from here.
@@ -284,12 +324,6 @@ final class RenderedVideoFeeder: @unchecked Sendable {
                 logger.error("Video decoding stopped: \(error)")
                 atEnd = true
             }
-            // Every 30 s while all is well, every 5 s while frames come late or are dropped.
-            let age = ContinuousClock.now - stats.since
-            if age > .seconds(30) || (age > .seconds(5) && stats.isDegraded) {
-                stats.report(codec: decoder.codecName, frameRate: decoder.frameRate, logger: logger)
-                stats = Stats()
-            }
         }
         // What the last window saw, so the end of a session isn't missing from the log.
         stats.add(decoder.takeStageTimes())
@@ -299,15 +333,17 @@ final class RenderedVideoFeeder: @unchecked Sendable {
 
 /// What the video thread did over a window of playback, for the log: where its time went (reading
 /// packets, decoding, converting, enqueueing, and waiting with enough queued), how far ahead of
-/// the clock frames reached the renderer, how many came after their start (and so showed late),
-/// and how many were dropped.
+/// the clock frames reached the renderer, how many came too close to their start to be sure to
+/// show in time, and how many were dropped.
 private struct Stats {
     let since = ContinuousClock.now
     /// Frames enqueued. While catching up they can still come too late to be seen.
     var shown = 0
     /// How far ahead of the clock each frame on the clock was enqueued.
     var leads: [Int64] = []
-    var late = 0
+    /// Reached the renderer with less than `thinLeadTicks` to spare, outside a seek's settling:
+    /// the same frames the hitch warning names.
+    var atRisk = 0
     /// Dropped undrawn on the way back to the clock after a seek: expected.
     var catchUpDrops = 0
     /// Dropped once on the clock because they came too late: the decoder fell behind.
@@ -325,14 +361,11 @@ private struct Stats {
     var slowCatchUp = false
 
     var dropped: Int { catchUpDrops + lateDrops }
-    var isDegraded: Bool { late > 0 || lateDrops > 0 || forcedShows > 0 || slowCatchUp }
+    var isDegraded: Bool { atRisk > 0 || lateDrops > 0 || forcedShows > 0 || slowCatchUp }
 
-    /// A frame this far past its start when enqueued shows visibly late: more than half a 60 Hz refresh.
-    static let lateTicks: Int64 = 100_000
-
-    mutating func record(lead: Int64) {
+    mutating func record(lead: Int64, atRisk: Bool) {
         leads.append(lead)
-        if lead < -Self.lateTicks { late += 1 }
+        if atRisk { self.atRisk += 1 }
     }
 
     mutating func add(_ times: RenderedVideoDecoder.StageTimes) {
@@ -348,7 +381,7 @@ private struct Stats {
     /// `Video mpeg4 at 24.000 fps: 720 enqueued, 0 dropped late, 0 forced, 12 dropped catching up in 30.0 s;
     /// per frame read 0.4 ms, decode 9.1 ms, convert 2.3 ms, enqueue 0.1 ms = 11.9 ms of 41.7 ms (worst 25.3 ms),
     /// can decode 84 fps; thread busy 29%, waiting 71% ahead; lead min 120 ms, median 480 ms;
-    /// 0 enqueued over 10 ms after their start; thermal nominal`
+    /// 0 with under 100 ms to spare; thermal nominal`
     func report(codec: String, frameRate: Double, logger: Logger) {
         guard shown > 0 || dropped > 0 else { return }
         let elapsed = ContinuousClock.now - since
@@ -369,7 +402,7 @@ private struct Stats {
         let text = "Video \(codec) at \(String(format: "%.3f", frameRate)) fps: \(shown) enqueued, \(lateDrops) dropped late, \(forcedShows) forced, \(catchUpDrops) dropped catching up in \(String(format: "%.1f", ms(elapsed) / 1000)) s; "
             + "per frame read \(perFrame(stages.read, decoded)), decode \(perFrame(stages.decode, decoded)), convert \(perFrame(stages.convert, converted)), enqueue \(perFrame(enqueue, shown)) = \(String(format: "%.1f", costMs)) ms of \(String(format: "%.1f", budgetMs)) ms (worst \(String(format: "%.1f", ms(worstFrame))) ms), can decode \(capacity); "
             + "thread busy \(share(work)), waiting \(share(waitAhead)) ahead; "
-            + "lead \(lead); \(late) enqueued over 10 ms after their start; thermal \(ProcessInfo.processInfo.thermalState.logName)"
+            + "lead \(lead); \(atRisk) with under \(RenderedVideoFeeder.thinLeadTicks / 10_000) ms to spare; thermal \(ProcessInfo.processInfo.thermalState.logName)"
         if isDegraded {
             logger.warning("\(text)")
         } else {

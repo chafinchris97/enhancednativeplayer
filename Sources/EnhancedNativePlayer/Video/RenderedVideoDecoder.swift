@@ -166,6 +166,14 @@ final class RenderedVideoDecoder {
                 seekTarget = nil
                 // A stream whose first frame starts a little late shows it from the target, not black.
                 shownFrom = min(previousStart, target)
+            } else {
+                // Each frame lasts until the next starts, so an uneven step is an uneven picture.
+                let length = start - previousStart
+                if length < frameTicks / 2 || length > frameTicks * 3 / 2 {
+                    throttle.log(logger, .warning, key: "length") {
+                        String(format: "Video timing: the frame at %.3f s shows for %.1f ms, a frame at this rate lasts %.1f ms", Double(previousStart) / 1e7, Double(length) / 10_000, Double(frameTicks) / 10_000)
+                    }
+                }
             }
             if skip(start) { continue }
             if let decoded = sample(previous, start: shownFrom, end: start) { return decoded }
@@ -197,7 +205,13 @@ final class RenderedVideoDecoder {
                 onFrameDecoded?()
                 let ts = frame.pointee.best_effort_timestamp
                 var start = ts == FF.noPTS ? (lastStart == .min ? 0 : lastStart + frameTicks) : timeBase.rescale(ts, to: .ticks) - originTicks
-                if lastStart != .min, start <= lastStart { start = lastStart + 1 }
+                if lastStart != .min, start <= lastStart {
+                    let given = start, previous = lastStart
+                    throttle.log(logger, .warning, key: "order") {
+                        String(format: "Video timing: a frame says it starts at %.3f s, not after the one before at %.3f s; it is moved after it and barely shows", Double(given) / 1e7, Double(previous) / 1e7)
+                    }
+                    start = lastStart + 1
+                }
                 lastStart = start
                 return (frame, start)
             }

@@ -80,27 +80,55 @@ final class RemoteFile: @unchecked Sendable {
 
     /// Returns block `index`, fetching it if needed. Blocks the calling thread.
     func block(_ index: Int, token: CancellationToken) throws -> Data {
+        let asked = ContinuousClock.now
+        /// Why the block wasn't in memory, for the slow-read log.
+        var missed: String?
         condition.lock()
         defer { condition.unlock() }
         while true {
             if closed || token.isCancelled { throw EnhancedPlayerError.cancelled }
             if let data = memory[index] {
                 touchMemory(index)
+                logIfSlow(index, since: asked, missed)
                 return data
             }
             if disk[index] != nil {
                 useClock += 1
                 disk[index] = useClock
+                let reading = ContinuousClock.now
                 if let data = try? Data(contentsOf: blockURL(index)) {
                     insertMemory(data, for: index)
+                    logIfSlow(index, since: asked, missed ?? "read from the disk cache in \(Self.ms(ContinuousClock.now - reading))")
                     return data
                 }
                 disk[index] = nil
             }
             if let error = failures.removeValue(forKey: index) { throw error }
+            if missed == nil {
+                missed = inflight[index] == nil
+                    ? "not cached or prefetched, fetched on demand with \(inflight.count) other fetches in flight"
+                    : "its prefetch was still in flight (\(inflight.count) fetches in flight)"
+            }
             if inflight[index] == nil { startFetch(index, attempt: 0) }
             _ = condition.wait(until: Date().addingTimeInterval(0.2))
         }
+    }
+
+    /// A reader waiting this long for a block is logged, with where the block came from.
+    static let slowBlock = Duration.milliseconds(50)
+    private let slowReads = LogThrottle(interval: .seconds(1))
+
+    private func logIfSlow(_ index: Int, since asked: ContinuousClock.Instant, _ missed: String?) {
+        let waited = ContinuousClock.now - asked
+        guard waited > Self.slowBlock, let missed else { return }
+        slowReads.log(logger, .warning, key: "slow") {
+            "Source block \(index) took \(Self.ms(waited)) to read: \(missed); \(memory.count) blocks in memory, \(disk.count) on disk"
+        }
+    }
+
+    private static func ms(_ duration: Duration) -> String {
+        let (seconds, attoseconds) = duration.components
+        return String(format: "%.1f ms", Double(seconds) * 1000 + Double(attoseconds) / 1e15)
     }
 
     /// Starts background fetches for blocks that are not cached yet.
