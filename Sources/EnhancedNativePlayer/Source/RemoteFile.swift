@@ -61,6 +61,7 @@ final class RemoteFile: @unchecked Sendable {
         var task: URLSessionDataTask?
         /// The block the current request ends before.
         var end = 0
+        /// The bytes received so far of the block at `frontier`.
         var partial = Data()
         var failedStatus: Int?
         var chunk: Int
@@ -253,14 +254,26 @@ final class RemoteFile: @unchecked Sendable {
         condition.lock()
         defer { condition.unlock() }
         guard let stream = tasks[task.taskIdentifier], stream.task === task else { return }
-        stream.partial.append(data)
         stream.attempt = 0
+        // Each byte is copied once, into the block it belongs to. Re-copying what's left of
+        // the data after every block costs a copy of the remainder per block, which for a
+        // delivery of many blocks at once (the session hands over what it has buffered while
+        // this queue was busy) adds up to many times the delivery.
         var delivered = false
-        while stream.frontier < stream.end {
+        var offset = data.startIndex
+        while stream.frontier < stream.end, offset < data.endIndex {
             let size = blockLength(stream.frontier)
-            guard stream.partial.count >= size else { break }
-            store(Data(stream.partial.prefix(size)), for: stream.frontier)
-            stream.partial = Data(stream.partial.dropFirst(size))
+            let take = min(size - stream.partial.count, data.endIndex - offset)
+            if stream.partial.isEmpty, take == size {
+                store(data.subdata(in: offset..<offset + take), for: stream.frontier)
+            } else {
+                if stream.partial.isEmpty { stream.partial.reserveCapacity(size) }
+                stream.partial.append(data[offset..<offset + take])
+                guard stream.partial.count == size else { offset += take; break }
+                store(stream.partial, for: stream.frontier)
+                stream.partial = Data()
+            }
+            offset += take
             stream.frontier += 1
             delivered = true
         }
