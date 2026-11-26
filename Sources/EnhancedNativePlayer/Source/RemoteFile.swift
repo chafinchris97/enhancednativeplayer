@@ -336,12 +336,19 @@ final class RemoteFile: @unchecked Sendable {
 
     /// Once a playback reader has read on for a few blocks on its own connection, the
     /// prefetcher starts reading where that connection will stop.
+    ///
+    /// It stays where it is only if it brings the first block from there on that isn't cached.
+    /// Blocks it read earlier may have been evicted since: after a restart behind the
+    /// playhead, the reader is inside the stretch the prefetcher already passed, and a
+    /// prefetcher left further on would leave the reader's own connection to fetch it all.
     private func handOverIfReadingOn(_ reader: Reader) {
         let own = reader.fetch
         guard reader.role == .playback, own.end == nil, own.position - own.runStart >= handOver else { return }
         let start = own.demand + handOverGap
         guard start < blockCount else { return }
-        if prefetch.demand >= 0, start >= prefetch.runStart, start <= prefetch.position + reach { return }
+        var missing = start
+        while missing < blockCount, missing < prefetch.position, isCached(missing) { missing += 1 }
+        if missing >= blockCount || isBringing(prefetch, missing) { return }
         own.end = start
         logger.debug("Source prefetch takes over from \(own.name) at block \(start)")
         move(prefetch, to: start, demand: own.demand)
