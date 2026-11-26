@@ -11,7 +11,10 @@ public struct EnhancedPlayerConfiguration: Sendable {
     /// Headers sent with every range request to the source (auth tokens, ...).
     public var httpHeaders: [String: String] = [:]
     /// Where segments and source blocks are cached. Defaults to the Caches directory.
-    /// Each session works in its own subdirectory and deletes it when it stops.
+    /// Each session works in its own subdirectory and deletes it when it stops. One left by a
+    /// session that never stopped (the app was killed) is deleted when a player is made or
+    /// playback starts. Only session subdirectories are touched, so the directory can hold
+    /// other files.
     public var cacheDirectory: URL?
     /// Disk budget for downloaded source blocks shared by the video and audio remux.
     public var sourceCacheBytes: Int64 = 768 << 20

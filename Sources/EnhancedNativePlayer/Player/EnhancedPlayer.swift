@@ -151,6 +151,28 @@ public final class EnhancedPlayer {
         self.logger = configuration.logger ?? .systemDefault
         // AVPlayer's automatic selection criteria stay on: with them off, AVKit's subtitles switch
         // stays off once the user turns subtitles off in its menu, whatever is selected after.
+
+        // Playback that never stopped (the app was killed) left its files behind; delete them
+        // now rather than at the next playback. Once per cache directory per process.
+        let base = SessionCache.base(for: configuration)
+        if Self.sweptCacheDirectories.withLock({ $0.insert(base.standardizedFileURL.path).inserted }) {
+            let logger = self.logger.category(.player)
+            Task.detached(priority: .utility) { SessionCache.removeStale(in: base, logger: logger) }
+        }
+    }
+
+    private static let sweptCacheDirectories = Mutex<Set<String>>([])
+
+    /// Deletes the cached segments and source blocks of every playback that is not running,
+    /// in the configuration's `cacheDirectory` (the Caches directory by default). A running
+    /// playback, in any player or process, keeps its files.
+    ///
+    /// The engine already does this when a player is made and when playback starts; call it
+    /// to free the space at another time, such as from a "clear cache" setting.
+    public nonisolated static func removeCachedFiles(configuration: EnhancedPlayerConfiguration = EnhancedPlayerConfiguration()) async {
+        let base = SessionCache.base(for: configuration)
+        let logger = (configuration.logger ?? .systemDefault).category(.player)
+        await Task.detached(priority: .utility) { SessionCache.removeStale(in: base, logger: logger) }.value
     }
 
     deinit {

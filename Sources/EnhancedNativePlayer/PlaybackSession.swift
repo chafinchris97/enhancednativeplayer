@@ -79,10 +79,11 @@ final class EnhancedPlaybackSession: Sendable {
         logger.category(.player).notice("\(SessionDescription.environment(configuration: configuration))")
         let started = Date()
 
-        let base = configuration.cacheDirectory
-            ?? FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("EnhancedNativePlayer", isDirectory: true)
-        let directory = base.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let base = SessionCache.base(for: configuration)
+        let sessionDirectory = try SessionDirectory(base: base)
+        let directory = sessionDirectory.url
+        let sweepLogger = logger.category(.player)
+        Task.detached(priority: .utility) { SessionCache.removeStale(in: base, logger: sweepLogger) }
 
         let headers = configuration.httpHeaders
         let externalTask = Task { await loadExternalSubtitles(externalSubtitles, headers: headers, logger: logger.category(.subtitles)) }
@@ -99,7 +100,7 @@ final class EnhancedPlaybackSession: Sendable {
                 logger: logger.category(.source)
             )
         } catch {
-            try? FileManager.default.removeItem(at: directory)
+            sessionDirectory.remove()
             throw error
         }
 
@@ -133,7 +134,7 @@ final class EnhancedPlaybackSession: Sendable {
             for line in SessionDescription.media(media, file: url) { player.notice("\(line)") }
             core = PlaybackSessionCore(
                 context: context,
-                directory: directory,
+                directory: sessionDirectory,
                 segmentsAhead: configuration.segmentsAhead,
                 externalFonts: external.flatMap(\.fonts),
                 trickplay: trickplayRendition,
@@ -141,7 +142,7 @@ final class EnhancedPlaybackSession: Sendable {
             )
         } catch {
             file.close()
-            try? FileManager.default.removeItem(at: directory)
+            sessionDirectory.remove()
             throw error
         }
 
@@ -396,7 +397,7 @@ final class EnhancedPlaybackSession: Sendable {
 final class PlaybackSessionCore: Sendable {
     let context: RemuxContext
     let playlists: PlaylistBuilder
-    private let directory: URL
+    private let directory: SessionDirectory
     private let video: SegmentPipeline
     /// Idle unless the player was given `master_sdr.m3u8`.
     private let sdrVideo: SegmentPipeline
@@ -420,7 +421,7 @@ final class PlaybackSessionCore: Sendable {
     /// How long `iframe.m3u8` waits for a video request before it is withheld.
     static let iFramePlaylistWaitSeconds: Double = 3
 
-    init(context: RemuxContext, directory: URL, segmentsAhead: Int, externalFonts: [ASSFont] = [], trickplay: TrickplayRendition? = nil, logger: Logger) {
+    init(context: RemuxContext, directory: SessionDirectory, segmentsAhead: Int, externalFonts: [ASSFont] = [], trickplay: TrickplayRendition? = nil, logger: Logger) {
         self.context = context
         self.directory = directory
         self.externalFonts = externalFonts
@@ -433,7 +434,7 @@ final class PlaybackSessionCore: Sendable {
         assEvents = ASSEventStore(context: context)
         video = SegmentPipeline(
             name: "video",
-            directory: directory.appendingPathComponent("video", isDirectory: true),
+            directory: directory.url.appendingPathComponent("video", isDirectory: true),
             segmentCount: context.plan.count,
             segmentsAhead: segmentsAhead,
             token: context.token,
@@ -445,7 +446,7 @@ final class PlaybackSessionCore: Sendable {
         )
         sdrVideo = SegmentPipeline(
             name: "video_sdr",
-            directory: directory.appendingPathComponent("video_sdr", isDirectory: true),
+            directory: directory.url.appendingPathComponent("video_sdr", isDirectory: true),
             segmentCount: context.plan.count,
             segmentsAhead: segmentsAhead,
             token: context.token,
@@ -457,7 +458,7 @@ final class PlaybackSessionCore: Sendable {
         )
         audio = SegmentPipeline(
             name: "audio",
-            directory: directory.appendingPathComponent("audio", isDirectory: true),
+            directory: directory.url.appendingPathComponent("audio", isDirectory: true),
             segmentCount: context.plan.count,
             segmentsAhead: segmentsAhead,
             token: context.token,
@@ -626,6 +627,6 @@ final class PlaybackSessionCore: Sendable {
         sdrVideo.stop()
         audio.stop()
         context.file.close()
-        try? FileManager.default.removeItem(at: directory)
+        directory.remove()
     }
 }
