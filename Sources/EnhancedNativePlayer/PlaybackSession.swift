@@ -363,6 +363,42 @@ final class EnhancedPlaybackSession: Sendable {
         return try RenderedVideoDecoder(file: context.file, media: context.media, originTicks: context.originTicks, token: token, logger: logger.category(.video))
     }
 
+    /// Chapter pictures made at once. Each worker has its own reader, connection and decoder:
+    /// a picture is mostly a wait on the network for one keyframe, then a decode on one core.
+    static let chapterPictureWorkers = 4
+
+    /// A JPEG of the video at each chapter's start, keyed by the chapter's start (file timeline),
+    /// for chapters that have no picture of their own. Makes `chapterPictureWorkers` at once on
+    /// utility threads; when `token` is cancelled, returns what is done. A chapter whose picture
+    /// can't be made is left out.
+    func chapterPictures(for chapters: [Range<Duration>], token: CancellationToken) async -> [Duration: Data] {
+        let context = core.context
+        let logger = logger.category(.video)
+        return await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async {
+                let started = ContinuousClock.now
+                let state = Mutex((next: 0, pictures: [Duration: Data]()))
+                DispatchQueue.concurrentPerform(iterations: min(Self.chapterPictureWorkers, chapters.count)) { _ in
+                    guard let thumbnailer = ChapterThumbnailer(file: context.file, media: context.media, token: token, logger: logger) else { return }
+                    while !token.isCancelled {
+                        let index = state.withLock { state in
+                            defer { state.next += 1 }
+                            return state.next
+                        }
+                        guard index < chapters.count else { return }
+                        let chapter = chapters[index]
+                        guard let picture = thumbnailer.picture(for: chapter) else { continue }
+                        state.withLock { $0.pictures[chapter.lowerBound] = picture }
+                    }
+                }
+                let pictures = state.withLock { $0.pictures }
+                let elapsed = ContinuousClock.now - started
+                logger.info("Made \(pictures.count) of \(chapters.count) chapter pictures in \(elapsed.components.seconds * 1000 + elapsed.components.attoseconds / 1_000_000_000_000_000) ms\(token.isCancelled ? " (stopped)" : "")")
+                continuation.resume(returning: pictures)
+            }
+        }
+    }
+
     /// Holds the first video segment of a seek until the player has decoded its frame; nil
     /// unless the player draws the video.
     var videoStartGate: VideoStartGate? { core.videoGate }

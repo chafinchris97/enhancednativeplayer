@@ -14,6 +14,8 @@ public struct Chapter: Hashable, Sendable {
     public var start: Duration
     /// Nil: the next chapter's start, or the end of the movie for the last one.
     public var end: Duration?
+    /// Nil, or an image that doesn't load: on tvOS the chapter shows a picture the player makes
+    /// from the video at its start, as soon as the file is open.
     public var artwork: Artwork?
 
     public init(title: String, start: Duration, end: Duration? = nil, artwork: Artwork? = nil) {

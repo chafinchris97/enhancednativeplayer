@@ -144,6 +144,12 @@ public final class EnhancedPlayer {
     @ObservationIgnored private var artworkLoads: [Artwork: Task<Void, Never>] = [:]
     @ObservationIgnored private var appliedMetadata: MetadataState?
     @ObservationIgnored private var appliedChapters: ChapterState?
+    /// Pictures made from the video for chapters with none of their own, by chapter start.
+    /// Kept for the loaded media, across its sessions.
+    @ObservationIgnored private var chapterPictures: [Duration: Data] = [:]
+    /// Chapter starts a picture has been made for or is being made for, whether or not one came of it.
+    @ObservationIgnored private var chapterPicturesAsked: Set<Duration> = []
+    @ObservationIgnored private var chapterPictureRun: (id: UUID, token: CancellationToken)?
 
     /// - Parameter configuration: Engine tuning, the same for everything this player loads.
     public init(configuration: EnhancedPlayerConfiguration = EnhancedPlayerConfiguration()) {
@@ -213,6 +219,8 @@ public final class EnhancedPlayer {
         currentTime = startTime ?? .zero
         duration = nil
         chapters = []
+        chapterPictures = [:]
+        chapterPicturesAsked = []
         audioTracks = []
         subtitleTracks = []
         audioSelection = nil
@@ -383,6 +391,7 @@ public final class EnhancedPlayer {
     private struct ChapterState: Equatable {
         var chapters: [Chapter]
         var loadedArtwork: Set<Artwork>
+        var madePictures: Set<Duration>
     }
 
     private func applyPresentation(to item: AVPlayerItem) {
@@ -406,19 +415,69 @@ public final class EnhancedPlayer {
         guard let session else { return }
         let artworks = Set(chapters.compactMap(\.artwork))
         artworks.forEach(loadArtwork)
+        makeChapterPictures(session: session)
         // Titles go up at once; images together once they have all arrived, not one by one.
-        if appliedChapters?.chapters == chapters, artworks.contains(where: { artworkLoads[$0] != nil }) { return }
-        let state = ChapterState(chapters: chapters, loadedArtwork: artworks.filter { artworkData($0) != nil })
+        // While pictures are being made from the video, the list waits for them, so it never
+        // shows without them.
+        if chapterPictureRun != nil { return }
+        let pending = artworks.contains(where: { artworkLoads[$0] != nil })
+        if appliedChapters?.chapters == chapters, pending { return }
+        let shown = chapters.map { chapter in
+            var chapter = chapter
+            if needsPicture(chapter), let picture = chapterPictures[chapter.start] { chapter.artwork = .data(picture) }
+            return chapter
+        }
+        let state = ChapterState(
+            chapters: chapters,
+            loadedArtwork: artworks.filter { artworkData($0) != nil },
+            madePictures: Set(chapters.filter { needsPicture($0) && chapterPictures[$0.start] != nil }.map(\.start))
+        )
         guard state != appliedChapters else { return }
         appliedChapters = state
         let markers = MetadataItems.chapterMarkers(
-            chapters,
+            shown,
             origin: session.originSeconds,
             movieEnd: session.originSeconds + session.duration,
             artwork: { self.artworkData($0) }
         )
         item.navigationMarkerGroups = markers.isEmpty ? [] : [AVNavigationMarkersGroup(title: nil, timedNavigationMarkers: markers)]
         #endif
+    }
+
+    /// Whether a chapter shows a picture made from the video: it has no image, or its image
+    /// didn't load.
+    private func needsPicture(_ chapter: Chapter) -> Bool {
+        switch chapter.artwork {
+        case nil: true
+        case .data(let data): data.isEmpty
+        case .url: failedArtwork.contains(chapter.artwork!)
+        }
+    }
+
+    /// Makes pictures from the video for the chapters that need one and have none yet, from
+    /// the moment the file is open. One run at a time; a chapter whose image fails to load
+    /// later gets its picture in the next run.
+    private func makeChapterPictures(session: EnhancedPlaybackSession) {
+        guard chapterPictureRun == nil else { return }
+        let movieEnd = Duration.seconds(session.originSeconds + session.duration)
+        let wanted = chapters.resolvingEnds(movieEnd: movieEnd)
+            .filter { !chapterPicturesAsked.contains($0.chapter.start) && needsPicture($0.chapter) }
+            .map { $0.chapter.start..<$0.end }
+        guard !wanted.isEmpty else { return }
+        chapterPicturesAsked.formUnion(wanted.map(\.lowerBound))
+        let run = (id: UUID(), token: CancellationToken(parent: session.cancellationToken))
+        chapterPictureRun = run
+        let generation = loadGeneration
+        Task { [weak self] in
+            let pictures = await session.chapterPictures(for: wanted, token: run.token)
+            guard let self, self.loadGeneration == generation else { return }
+            self.chapterPictures.merge(pictures) { _, new in new }
+            // Stopped part way: the rest are asked for again in the next session.
+            if run.token.isCancelled { self.chapterPicturesAsked.subtract(wanted.map(\.lowerBound).filter { pictures[$0] == nil }) }
+            guard self.chapterPictureRun?.id == run.id else { return }
+            self.chapterPictureRun = nil
+            if let item = self.item { self.applyPresentation(to: item) }
+        }
     }
 
     private func artworkData(_ artwork: Artwork) -> Data? {
@@ -538,6 +597,11 @@ public final class EnhancedPlayer {
             startSelection.subtitle = nil
         }
         session.setStartSelection(startSelection)
+        #if os(tvOS)
+        // Made while the display switches and the first segments are prepared, so the chapter
+        // list has its pictures by the time it can be opened.
+        makeChapterPictures(session: session)
+        #endif
         audioSelection = session.defaultAudioIndex(startSelection).map { session.audioTracks[$0] }
         subtitleSelection = session.defaultSubtitleIndex(startSelection).map { session.subtitleTracks[$0] }
         answerWaiters()
@@ -581,6 +645,8 @@ public final class EnhancedPlayer {
         item = nil
         appliedMetadata = nil
         appliedChapters = nil
+        chapterPictureRun?.token.cancel()
+        chapterPictureRun = nil
         if audioSessionActive {
             audioSessionActive = false
             try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
