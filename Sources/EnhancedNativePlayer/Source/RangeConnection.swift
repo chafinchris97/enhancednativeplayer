@@ -1,18 +1,26 @@
 import Foundation
 import Network
 
-/// One HTTP/1.1 GET of a file from `offset` to its end, read only as fast as the caller asks.
+/// One HTTP/1.1 GET of a file from `offset`, to its end or to `end`, read only as fast as
+/// the caller asks.
 ///
 /// Not reading is how it pauses: the socket's buffers fill, TCP holds the server back, and
 /// the response carries on where it stopped once reading resumes. One open-ended request
 /// replaces the series of ranges a client would otherwise ask for, so the server's wait
 /// before a response's first byte comes once per position read from, not once per range.
 ///
+/// A request with an `end` asks to keep the connection open. Once its response has been read
+/// to the last byte, the next request made with `reusing:` it is sent on the same socket,
+/// without a new TCP and TLS handshake. A reused socket the server has closed meanwhile is
+/// replaced by a new one, once, before the request fails.
+///
 /// Redirects are followed. Every callback runs on `queue`; only one read is outstanding
 /// at a time.
 final class RangeConnection: @unchecked Sendable {
     enum Failure: Error, CustomStringConvertible {
         case status(Int)
+        /// 429 or 503: the server asks for fewer or later requests, and how long to wait if it says.
+        case throttled(status: Int, retryAfter: TimeInterval?)
         /// The server answered the range with the whole file.
         case notPartial
         case malformed(String)
@@ -25,6 +33,8 @@ final class RangeConnection: @unchecked Sendable {
         var description: String {
             switch self {
             case .status(let status): "HTTP \(status)"
+            case .throttled(let status, let retryAfter?): "HTTP \(status), retry after \(Int(retryAfter.rounded(.up))) s"
+            case .throttled(let status, nil): "HTTP \(status)"
             case .notPartial: "the server ignored the range and sent the whole file"
             case .malformed(let what): "malformed response: \(what)"
             case .closedEarly: "the server closed the connection before the end of the response"
@@ -45,6 +55,16 @@ final class RangeConnection: @unchecked Sendable {
     private let queue: DispatchQueue
     private let headers: [String: String]
     private let offset: Int64
+    /// The byte after the last one asked for; nil asks for the rest of the file.
+    private let end: Int64?
+    /// A finished response whose socket this request may be sent on.
+    private var previous: RangeConnection?
+    /// Whether the request went out on a socket an earlier response used.
+    private var reused = false
+    /// Whether the server's head lets the socket carry another request.
+    private var serverKeepsAlive = false
+    /// The response was read to its end and the socket is free for the next request.
+    private var idle = false
     private var url: URL
     private var redirects = 0
     private var connection: NWConnection?
@@ -60,10 +80,12 @@ final class RangeConnection: @unchecked Sendable {
     private var failure: Error?
     private var timer: DispatchWorkItem?
 
-    init(url: URL, headers: [String: String], offset: Int64, queue: DispatchQueue) {
+    init(url: URL, headers: [String: String], offset: Int64, end: Int64? = nil, reusing previous: RangeConnection? = nil, queue: DispatchQueue) {
         self.url = url
         self.headers = headers
         self.offset = offset
+        self.end = end
+        self.previous = end == nil ? nil : previous
         self.queue = queue
     }
 
@@ -102,11 +124,53 @@ final class RangeConnection: @unchecked Sendable {
 
     // MARK: - On the queue
 
-    private func connect() {
+    private struct Endpoint: Equatable {
+        let host: String
+        let port: Int
+        let secure: Bool
+    }
+
+    private func endpoint() -> Endpoint? {
         guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https",
-              let host = url.host, !host.isEmpty else { return fail(Failure.unsupportedURL) }
+              let host = url.host, !host.isEmpty else { return nil }
         let secure = scheme == "https"
-        let port = url.port ?? (secure ? 443 : 80)
+        return Endpoint(host: host, port: url.port ?? (secure ? 443 : 80), secure: secure)
+    }
+
+    /// Whether every byte of the response has arrived and the socket can carry another request,
+    /// whether or not the end has been read yet.
+    private var isReusable: Bool {
+        end != nil && failure == nil && onHead == nil && chunks == nil && remaining == 0
+            && serverKeepsAlive && buffer.isEmpty && !peerClosed
+    }
+
+    /// Hands over the socket if the response was read to its end and it leads to `endpoint`.
+    private func takeIdleSocket(for endpoint: Endpoint) -> NWConnection? {
+        guard idle || isReusable, let connection, self.endpoint() == endpoint, case .ready = connection.state else { return nil }
+        idle = false
+        self.connection = nil
+        connection.stateUpdateHandler = nil
+        return connection
+    }
+
+    private func connect() {
+        guard let endpoint = endpoint() else { return fail(Failure.unsupportedURL) }
+        let (host, port, secure) = (endpoint.host, endpoint.port, endpoint.secure)
+        let socket = previous?.takeIdleSocket(for: endpoint)
+        // Closes the earlier response's socket if it wasn't taken.
+        previous?.fail(Failure.cancelled)
+        previous = nil
+        if let socket {
+            reused = true
+            connection = socket
+            socket.stateUpdateHandler = { [weak self, weak socket] state in
+                guard let self, let socket, socket === self.connection else { return }
+                if case .failed(let error) = state { self.fail(error) }
+            }
+            armTimer()
+            return send(on: socket, host: host, port: port, secure: secure)
+        }
+        reused = false
         guard let nwPort = NWEndpoint.Port(rawValue: UInt16(clamping: port)) else { return fail(Failure.unsupportedURL) }
         let parameters = secure ? NWParameters(tls: NWProtocolTLS.Options(), tcp: NWProtocolTCP.Options()) : NWParameters.tcp
         let connection = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: parameters)
@@ -143,10 +207,12 @@ final class RangeConnection: @unchecked Sendable {
         if !headers.keys.contains(where: { $0.lowercased() == "user-agent" }) {
             lines.append("User-Agent: EnhancedNativePlayer")
         }
-        lines += ["Accept: */*", "Accept-Encoding: identity", "Range: bytes=\(offset)-", "Connection: close"]
+        let range = end.map { "bytes=\(offset)-\($0 - 1)" } ?? "bytes=\(offset)-"
+        lines += ["Accept: */*", "Accept-Encoding: identity", "Range: \(range)", "Connection: \(end == nil ? "close" : "keep-alive")"]
         let request = Data((lines.joined(separator: "\r\n") + "\r\n\r\n").utf8)
         connection.send(content: request, completion: .contentProcessed { [weak self, weak connection] error in
             guard let self, let connection, connection === self.connection, let error else { return }
+            if self.reused, self.buffer.isEmpty { return self.reconnectFresh() }
             self.fail(error)
         })
         receiveHead(on: connection)
@@ -156,6 +222,10 @@ final class RangeConnection: @unchecked Sendable {
         connection.receive(minimumIncompleteLength: 1, maximumLength: Self.maxHeadBytes) { [weak self, weak connection] data, _, isComplete, error in
             guard let self, let connection, connection === self.connection, self.onHead != nil else { return }
             if let data { self.buffer.append(data) }
+            if self.reused, self.buffer.isEmpty, isComplete || error != nil {
+                // The server closed the socket while it sat idle.
+                return self.reconnectFresh()
+            }
             if let end = self.buffer.range(of: Data("\r\n\r\n".utf8)) {
                 let head = self.buffer[self.buffer.startIndex..<end.lowerBound]
                 self.buffer = Data(self.buffer[end.upperBound...])
@@ -173,6 +243,16 @@ final class RangeConnection: @unchecked Sendable {
         }
     }
 
+    /// Sends the request again on a new socket, after a reused one turned out to be closed.
+    private func reconnectFresh() {
+        reused = false
+        connection?.cancel()
+        connection = nil
+        buffer = Data()
+        peerClosed = false
+        connect()
+    }
+
     private func parse(head: Data) {
         let lines = String(decoding: head, as: UTF8.self).components(separatedBy: "\r\n")
         let statusParts = lines.first?.split(separator: " ", maxSplits: 2) ?? []
@@ -186,6 +266,9 @@ final class RangeConnection: @unchecked Sendable {
             fields[name] = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
         }
 
+        let connectionField = fields["connection"]?.lowercased() ?? ""
+        serverKeepsAlive = statusParts[0] == "HTTP/1.0" ? connectionField.contains("keep-alive") : !connectionField.contains("close")
+
         if [301, 302, 303, 307, 308].contains(status), let location = fields["location"] {
             redirects += 1
             guard redirects <= Self.maxRedirects else { return fail(Failure.tooManyRedirects) }
@@ -198,6 +281,9 @@ final class RangeConnection: @unchecked Sendable {
             peerClosed = false
             url = next
             return connect()
+        }
+        if status == 429 || status == 503 {
+            return fail(Failure.throttled(status: status, retryAfter: fields["retry-after"].flatMap(Self.retryAfter)))
         }
         guard status == 206 else {
             return fail((200..<300).contains(status) ? Failure.notPartial : Failure.status(status))
@@ -244,8 +330,20 @@ final class RangeConnection: @unchecked Sendable {
         if !out.isEmpty { return deliver(.success(out)) }
         if remaining == 0 || chunks?.done == true {
             finished = true
-            connection?.cancel()
-            connection = nil
+            if isReusable, let connection {
+                // Kept for the next request; `cancel` closes it if none comes.
+                idle = true
+                connection.stateUpdateHandler = { [weak self, weak connection] state in
+                    guard let self, let connection, connection === self.connection else { return }
+                    switch state {
+                    case .failed, .cancelled: self.idle = false
+                    default: break
+                    }
+                }
+            } else {
+                connection?.cancel()
+                connection = nil
+            }
             return deliver(.success(nil))
         }
         if peerClosed {
@@ -287,6 +385,18 @@ final class RangeConnection: @unchecked Sendable {
             callback(.failure(error))
         }
         if reading != nil { deliver(.failure(error)) }
+    }
+
+    /// `Retry-After` as seconds from now: a number of seconds, or an HTTP date.
+    static func retryAfter(_ value: String) -> TimeInterval? {
+        let text = value.trimmingCharacters(in: .whitespaces)
+        if let seconds = TimeInterval(text) { return seconds >= 0 ? seconds : nil }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "GMT")
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+        guard let date = formatter.date(from: text) else { return nil }
+        return max(0, date.timeIntervalSinceNow)
     }
 
     private func armTimer() {

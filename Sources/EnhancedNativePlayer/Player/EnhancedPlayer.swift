@@ -508,6 +508,7 @@ public final class EnhancedPlayer {
                 self.session = session
                 self.sessionForCleanup.withLock { $0 = session }
                 self.sessionDidOpen(session)
+                session.prepareSegments(at: max(0, (self.startPosition ?? 0) - session.originSeconds), selection: self.startSelection)
                 try await self.matchDisplay(to: session)
                 guard !Task.isCancelled, self.session === session else { return }
                 log(.display).info("Display ready, starting AVPlayer")
@@ -687,6 +688,7 @@ public final class EnhancedPlayer {
         appliedMetadata = nil
         appliedChapters = nil
         applyPresentation(to: item)
+        session.setStartOffset(startPosition.map { max(0, $0 - session.originSeconds) })
         avPlayer.pause()
         avPlayer.replaceCurrentItem(with: item)
         forcedSubtitles?.stop()

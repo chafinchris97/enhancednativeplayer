@@ -14,8 +14,11 @@ actor SubtitleSegmentCache<Value: Sendable> {
 
     private var loaded: [Key: Value] = [:]
     private var loading: [Key: Task<Value, Error>] = [:]
+    private var tokens: [Key: CancellationToken] = [:]
 
-    func value(track: Int, segment: Int, read: @escaping @Sendable () throws -> Value) async throws -> Value {
+    /// With `token`, the read can be stopped by `cancelLoads(outside:)`; `read` has to
+    /// pass it on to what it reads with.
+    func value(track: Int, segment: Int, token: CancellationToken? = nil, read: @escaping @Sendable () throws -> Value) async throws -> Value {
         let key = Key(track: track, segment: segment)
         if let value = loaded[key] { return value }
         if let task = loading[key] { return try await task.value }
@@ -23,10 +26,23 @@ actor SubtitleSegmentCache<Value: Sendable> {
             try await runBlocking(label: "ENP.subtitle", read)
         }
         loading[key] = task
-        defer { loading[key] = nil }
+        tokens[key] = token
+        defer {
+            loading[key] = nil
+            tokens[key] = nil
+        }
         let value = try await task.value
         loaded[key] = value
         return value
+    }
+
+    /// Stops the reads still running for segments outside `segments`, of any track. After a
+    /// seek they are for the position the player left, and would take bandwidth from the
+    /// one it is going to.
+    func cancelLoads(outside segments: ClosedRange<Int>) {
+        for (key, token) in tokens where !segments.contains(key.segment) {
+            token.cancel()
+        }
     }
 
     /// Forgets all but `segments` of `track`.
@@ -46,7 +62,7 @@ enum SubtitlePacketReader {
     /// Calls `body` with each of the segment's packets and its position in the playlist timeline.
     /// Where the read walks the video too (Matroska), `videoFrame` gets the position of each
     /// video frame that starts in the segment, in demux order.
-    static func forEachPacket(context: RemuxContext, track: SubtitleTrack, segment: Int, videoFrame: ((Int64) -> Void)? = nil, body: (Packet, Int64) throws -> Void) throws {
+    static func forEachPacket(context: RemuxContext, track: SubtitleTrack, segment: Int, token: CancellationToken? = nil, videoFrame: ((Int64) -> Void)? = nil, body: (Packet, Int64) throws -> Void) throws {
         let grid = context.subtitleGrid
         let start = grid.startTicks(of: segment)
         let end = grid.endTicks(of: segment)
@@ -57,7 +73,7 @@ enum SubtitlePacketReader {
         // MP4 sample tables jump straight from one cue to the next. Matroska has to walk
         // the clusters, and a sparse track could have no next cue for most of the file,
         // so the video stays on there: its packets say when the segment has been passed.
-        let demuxer = try Demuxer(file: context.file, token: context.token, findStreamInfo: false, role: .subtitles)
+        let demuxer = try Demuxer(file: context.file, token: token ?? context.token, findStreamInfo: false, role: .subtitles)
         let walksFile = !context.media.keyframes.usesDecodeTimestamps
         demuxer.discardAll(except: walksFile ? [track.streamIndex, video.streamIndex] : [track.streamIndex])
         if segment > 0 {
@@ -121,9 +137,9 @@ enum SubtitleCueReader {
     /// For a packet with no duration.
     private static let fallbackDurationTicks: Int64 = 30_000_000
 
-    static func read(context: RemuxContext, track: SubtitleTrack, format: SubtitleTextFormat, segment: Int) throws -> [SubtitleCue] {
+    static func read(context: RemuxContext, track: SubtitleTrack, format: SubtitleTextFormat, segment: Int, token: CancellationToken? = nil) throws -> [SubtitleCue] {
         var cues: [SubtitleCue] = []
-        try SubtitlePacketReader.forEachPacket(context: context, track: track, segment: segment) { packet, position in
+        try SubtitlePacketReader.forEachPacket(context: context, track: track, segment: segment, token: token) { packet, position in
             guard let text = WebVTT.cueText(payload: packet.subtitlePayload, format: format) else { return }
             let duration = packet.duration > 0 ? track.timeBase.rescaleNearest(packet.duration, to: .ticks) : fallbackDurationTicks
             let cueEnd = position + duration

@@ -31,10 +31,25 @@ enum ReadRole: Sendable, CustomStringConvertible {
 /// Each connection is one request from a position to the end of the file, read only as far
 /// ahead as needed and paused, by not reading, once it is. Each reader has its own, so a
 /// jump to an index or a subtitle read never waits for another reader's connection to move.
-/// Once a playback reader has read on for a few blocks, the prefetcher takes over reading
-/// ahead of it, further than a reader's own connection does; the reader then reads from
-/// the cache and its own connection closes. A reader waits on any connection that is about
+/// Once a playback reader has read on for a few blocks, its connection becomes the
+/// prefetcher, which reads further ahead than a reader's own connection does, and the
+/// reader reads from the cache. The connection carries on rather than a new one opening:
+/// a server slow to answer a new position would make each handover a stall of its own,
+/// right after the one a seek already caused. A reader waits on any connection that is about
 /// to bring the block it wants, whoever's it is, rather than fetch it twice.
+///
+/// Lookup and subtitle readers jump more than they read on, so their connections ask for
+/// bounded ranges instead, starting at one block after a jump and growing as the reader reads
+/// on. Each is kept open once its response is read, and the next range, wherever it is, goes
+/// out on the same socket without a new handshake.
+///
+/// A connection a reader waits on that brings less than `trickleFloor` in `trickleWindow` is
+/// replaced by a new one at the same place: a stalled route or an overloaded server node
+/// often keeps a connection alive at a trickle while a new one gets full speed.
+///
+/// A server that answers 429 or 503 gets no new requests until its `Retry-After` has passed,
+/// and from then on no more connections at once than it had open, less one. A reader waiting
+/// on a block takes the place of a connection nobody waits on when the limit is reached.
 ///
 /// After a redirect, later connections go straight to where it led, back to the file's own
 /// URL if that stops working.
@@ -58,13 +73,16 @@ final class RemoteFile: @unchecked Sendable {
     private let firstReadAhead = 2
     /// A block this close past a connection's position is waited for on it.
     private let reach = 16
-    /// Blocks a playback reader reads on its own connection before the prefetcher takes over.
+    /// Blocks a playback reader reads on its own connection before it becomes the prefetcher.
     private let handOver = 4
-    /// How far past that reader the prefetcher starts. The reader's own connection fetches
-    /// the blocks up to there, which covers a slow server's wait for the prefetcher's first byte.
-    private let handOverGap = 32
     /// A connection paused this long is closed; it opens again when a reader needs it.
     private let idleClose = Duration.seconds(15)
+    /// A connection a reader waits on that brings fewer bytes than this in a window is replaced.
+    /// Set before the first read; tests shorten the window.
+    var trickleWindow = Duration.seconds(20)
+    var trickleFloor = 2 << 20
+    /// The longest `Retry-After` waited for; a longer one is retried after this.
+    private static let maxRetryAfter: TimeInterval = 60
 
     private let condition = NSCondition()
     private var memory: [Int: Data] = [:]
@@ -75,14 +93,27 @@ final class RemoteFile: @unchecked Sendable {
     private var closed = false
     /// Where connections go: the file's URL, or where it last redirected to.
     private var target: URL
+    /// How many connections the server takes at once, once it has throttled; nil until then.
+    private var connectionLimit: Int?
+    /// No connection opens before this, after the server asked to wait.
+    private var holdUntil: ContinuousClock.Instant?
 
     /// One connection and where it reads. Guarded by `condition`.
     fileprivate final class Fetch: @unchecked Sendable {
-        let name: String
-        let maxAhead: Int
+        var name: String
+        var maxAhead: Int
         /// Whether its read-ahead starts small after a move and grows with what's read.
-        let ramps: Bool
+        var ramps: Bool
+        /// Whether it asks for bounded ranges on a kept-open socket instead of the rest of the file.
+        let bounded: Bool
         var connection: RangeConnection?
+        /// A bounded connection whose response was read to its end, kept for the next request.
+        var idle: RangeConnection?
+        /// The block after the last one its bounded range asked for.
+        var requestEnd = 0
+        /// When the throughput window opened, while a reader waits on it, and the bytes since.
+        var windowStart: ContinuousClock.Instant?
+        var windowBytes = 0
         /// Tells the current connection's callbacks from those of one already closed.
         var generation = 0
         /// The block it delivers next, or where it opens if it has no connection.
@@ -97,23 +128,23 @@ final class RemoteFile: @unchecked Sendable {
         /// nothing has been.
         var runStart = 0
         var demand = -1
-        /// Where it stops: the prefetcher took over from there.
-        var end: Int?
         var waiters = 0
         var pausedAt: ContinuousClock.Instant?
         var retired = false
 
-        init(name: String, maxAhead: Int, ramps: Bool) {
+        init(name: String, maxAhead: Int, ramps: Bool, bounded: Bool = false) {
             self.name = name
             self.maxAhead = maxAhead
             self.ramps = ramps
+            self.bounded = bounded
         }
     }
 
     /// A reader's handle: its role and its own connection.
     final class Reader: @unchecked Sendable {
         let role: ReadRole
-        fileprivate let fetch: Fetch
+        /// Replaced by a new one when its connection becomes the prefetcher.
+        fileprivate var fetch: Fetch
 
         fileprivate init(role: ReadRole, fetch: Fetch) {
             self.role = role
@@ -121,7 +152,8 @@ final class RemoteFile: @unchecked Sendable {
         }
     }
 
-    private let prefetch: Fetch
+    /// Replaced when a reader's connection becomes the prefetcher.
+    private var prefetch: Fetch
     /// Every connection that may be reading: the prefetcher, each reader's, and the one
     /// `open` made to learn the length, which reads the start of the file for the probe.
     private var fetches: [Fetch]
@@ -170,6 +202,7 @@ final class RemoteFile: @unchecked Sendable {
         switch error {
         case RangeConnection.Failure.notPartial: EnhancedPlayerError.rangeRequestsUnsupported(url)
         case RangeConnection.Failure.status(let status): EnhancedPlayerError.http(status: status, url: url)
+        case RangeConnection.Failure.throttled(let status, _): EnhancedPlayerError.http(status: status, url: url)
         case RangeConnection.Failure.cancelled: EnhancedPlayerError.cancelled
         default: EnhancedPlayerError.network(String(describing: error))
         }
@@ -192,7 +225,8 @@ final class RemoteFile: @unchecked Sendable {
         condition.lock()
         defer { condition.unlock() }
         nextReader += 1
-        let reader = Reader(role: role, fetch: Fetch(name: "\(role) \(nextReader)", maxAhead: readerAhead, ramps: true))
+        let fetch = Fetch(name: "\(role) \(nextReader)", maxAhead: readerAhead, ramps: true, bounded: role != .playback)
+        let reader = Reader(role: role, fetch: fetch)
         fetches.append(reader.fetch)
         return reader
     }
@@ -254,11 +288,13 @@ final class RemoteFile: @unchecked Sendable {
             }
             if fetch !== waitingOn {
                 waitingOn?.waiters -= 1
+                if fetch.waiters == 0 { fetch.windowStart = nil }
                 fetch.waiters += 1
                 waitingOn = fetch
             }
             if fetch === reader.fetch { handOverIfReadingOn(reader) }
             resume(fetch)
+            replaceIfTrickling(fetch)
             _ = condition.wait(until: Date().addingTimeInterval(0.2))
         }
     }
@@ -284,7 +320,7 @@ final class RemoteFile: @unchecked Sendable {
     func close() {
         condition.lock()
         closed = true
-        fetches.forEach(closeConnection)
+        fetches.forEach(retire)
         fetches.removeAll()
         memory.removeAll()
         memoryOrder.removeAll()
@@ -301,21 +337,21 @@ final class RemoteFile: @unchecked Sendable {
 
     private func ahead(_ fetch: Fetch) -> Int {
         guard fetch.ramps else { return fetch.maxAhead }
+        // A bounded range after a jump is the one block asked for, so it is read to its end,
+        // and its socket free for the next one, by the time the reader jumps again.
+        if fetch.bounded { return min(fetch.maxAhead, fetch.demand - fetch.runStart) }
         return min(fetch.maxAhead, max(firstReadAhead, fetch.demand - fetch.runStart + 1))
     }
 
     /// Whether the connection should be reading at its position.
     private func wantsMore(_ fetch: Fetch) -> Bool {
         guard !fetch.retired, fetch.demand >= 0, fetch.position < blockCount else { return false }
-        if let end = fetch.end, fetch.position >= end { return false }
         return fetch.position <= fetch.demand + ahead(fetch)
     }
 
     /// Whether a reader wanting `index` should wait on this connection.
     private func isBringing(_ fetch: Fetch, _ index: Int) -> Bool {
-        guard !fetch.retired, fetch.demand >= 0, index >= fetch.position, index <= fetch.position + reach else { return false }
-        if let end = fetch.end, index >= end { return false }
-        return true
+        !fetch.retired && fetch.demand >= 0 && index >= fetch.position && index <= fetch.position + reach
     }
 
     /// A reader got block `index` from the cache. The next block it lacks, if close, should
@@ -334,27 +370,37 @@ final class RemoteFile: @unchecked Sendable {
         }
     }
 
-    /// Once a playback reader has read on for a few blocks on its own connection, the
-    /// prefetcher starts reading where that connection will stop.
+    /// Once a playback reader has read on for a few blocks on its own connection, that
+    /// connection becomes the prefetcher and the reader gets a new one, unopened.
     ///
-    /// It stays where it is only if it brings the first block from there on that isn't cached.
-    /// Blocks it read earlier may have been evicted since: after a restart behind the
-    /// playhead, the reader is inside the stretch the prefetcher already passed, and a
-    /// prefetcher left further on would leave the reader's own connection to fetch it all.
+    /// The prefetcher stays as it is only if it brings the first block past the reader's
+    /// connection that isn't cached. Blocks it read earlier may have been evicted since:
+    /// after a restart behind the playhead, the reader is inside the stretch the prefetcher
+    /// already passed, and a prefetcher left further on would leave the reader's own
+    /// connection to fetch it all.
     private func handOverIfReadingOn(_ reader: Reader) {
         let own = reader.fetch
-        guard reader.role == .playback, own.end == nil, own.position - own.runStart >= handOver else { return }
-        let start = own.demand + handOverGap
-        guard start < blockCount else { return }
-        var missing = start
+        guard reader.role == .playback, own.connection != nil, own.position - own.runStart >= handOver else { return }
+        var missing = own.position + reach
         while missing < blockCount, missing < prefetch.position, isCached(missing) { missing += 1 }
         if missing >= blockCount || isBringing(prefetch, missing) { return }
-        own.end = start
-        logger.debug("Source prefetch takes over from \(own.name) at block \(start)")
-        move(prefetch, to: start, demand: own.demand)
+        logger.debug("Source connection \(own.name) at block \(own.position) becomes the prefetcher")
+        retire(prefetch)
+        let fresh = Fetch(name: own.name, maxAhead: readerAhead, ramps: true)
+        own.name = prefetch.name
+        own.maxAhead = prefetchAhead
+        own.ramps = false
+        prefetch = own
+        reader.fetch = fresh
+        fetches.append(fresh)
+        condition.broadcast()
     }
 
     private func move(_ fetch: Fetch, to index: Int, demand: Int) {
+        if fetch.bounded, fetch.connection != nil, !fetch.connecting, fetch.partial.isEmpty, fetch.position >= fetch.requestEnd {
+            // Its range has all arrived, though its end may not have been read: the socket is free.
+            park(fetch)
+        }
         if fetch.connection != nil, fetch.position != index {
             logger.debug("Source connection \(fetch.name) moved from block \(fetch.position) to \(index)")
         }
@@ -362,7 +408,6 @@ final class RemoteFile: @unchecked Sendable {
         fetch.position = index
         fetch.runStart = index
         fetch.demand = demand
-        fetch.end = nil
         fetch.attempt = 0
         resume(fetch)
     }
@@ -372,10 +417,11 @@ final class RemoteFile: @unchecked Sendable {
         guard !closed, !fetch.backingOff else { return }
         if fetch.connection == nil {
             while fetch.position < blockCount, isCached(fetch.position) { fetch.position += 1 }
-            guard wantsMore(fetch) else { return }
+            guard wantsMore(fetch), mayOpen(fetch) else { return }
             open(fetch)
         } else if !fetch.connecting, !fetch.reading {
-            if wantsMore(fetch) {
+            // A bounded range is read to its end, which frees its socket for the next one.
+            if wantsMore(fetch) || fetch.bounded {
                 readNext(fetch, fetch.generation)
             } else {
                 pause(fetch)
@@ -383,10 +429,34 @@ final class RemoteFile: @unchecked Sendable {
         }
     }
 
+    /// Whether the server's wait and connection limit let the connection open now.
+    private func mayOpen(_ fetch: Fetch) -> Bool {
+        if let holdUntil {
+            guard ContinuousClock.now >= holdUntil else { return false }
+            self.holdUntil = nil
+        }
+        guard let limit = connectionLimit else { return true }
+        let open = fetches.filter { $0 !== fetch && $0.connection != nil }
+        if open.count < limit { return true }
+        guard fetch.waiters > 0, let spare = open.first(where: { $0.waiters == 0 }) else { return false }
+        logger.debug("Source connection \(spare.name) closed for \(fetch.name), which a reader waits on, at the server's limit of \(limit)")
+        closeConnection(spare)
+        return true
+    }
+
     private func open(_ fetch: Fetch) {
         fetch.generation += 1
         let id = fetch.generation
-        let connection = RangeConnection(url: target, headers: headers, offset: Int64(fetch.position) * Int64(blockSize), queue: queue)
+        let offset = Int64(fetch.position) * Int64(blockSize)
+        var end: Int64?
+        if fetch.bounded {
+            let last = min(blockCount - 1, max(fetch.position, fetch.demand + ahead(fetch)))
+            end = min(length, Int64(last + 1) * Int64(blockSize))
+            fetch.requestEnd = last + 1
+        }
+        let reusing = fetch.idle
+        fetch.idle = nil
+        let connection = RangeConnection(url: target, headers: headers, offset: offset, end: end, reusing: reusing, queue: queue)
         fetch.connection = connection
         fetch.connecting = true
         fetch.partial = Data()
@@ -404,10 +474,55 @@ final class RemoteFile: @unchecked Sendable {
         fetch.backingOff = false
         fetch.pausedAt = nil
         fetch.partial = Data()
+        fetch.windowStart = nil
+    }
+
+    /// Keeps a bounded connection whose response was read to its end for the next request.
+    private func park(_ fetch: Fetch) {
+        let connection = fetch.connection
+        fetch.connection = nil
+        closeConnection(fetch)
+        fetch.idle?.cancel()
+        fetch.idle = nil
+        guard let connection else { return }
+        guard connectionLimit == nil else { return connection.cancel() }
+        fetch.idle = connection
+        queue.asyncAfter(deadline: .now() + .seconds(Int(idleClose.components.seconds))) { [weak self, fetch, connection] in
+            guard let self else { return }
+            self.condition.lock()
+            defer { self.condition.unlock() }
+            guard fetch.idle === connection else { return }
+            fetch.idle = nil
+            connection.cancel()
+        }
+    }
+
+    /// Replaces the connection a reader waits on if it has brought too little for a while.
+    private func replaceIfTrickling(_ fetch: Fetch) {
+        guard fetch.connection != nil, !fetch.connecting, !fetch.backingOff else {
+            fetch.windowStart = nil
+            return
+        }
+        let now = ContinuousClock.now
+        guard let start = fetch.windowStart else {
+            fetch.windowStart = now
+            fetch.windowBytes = 0
+            return
+        }
+        guard now - start >= trickleWindow else { return }
+        let bytes = fetch.windowBytes
+        fetch.windowStart = now
+        fetch.windowBytes = 0
+        guard bytes < trickleFloor else { return }
+        logger.warning("Source connection \(fetch.name) at block \(fetch.position) brought \(bytes >> 10) KB in \(Self.ms(trickleWindow)) while a reader waited; replaced by a new one")
+        closeConnection(fetch)
+        resume(fetch)
     }
 
     private func retire(_ fetch: Fetch) {
         closeConnection(fetch)
+        fetch.idle?.cancel()
+        fetch.idle = nil
         fetch.retired = true
         fetches.removeAll { $0 === fetch }
     }
@@ -421,6 +536,7 @@ final class RemoteFile: @unchecked Sendable {
 
     /// Far enough ahead: stop reading, and close the connection if it stays that way.
     private func pause(_ fetch: Fetch) {
+        fetch.windowStart = nil
         guard fetch.pausedAt == nil else { return }
         let now = ContinuousClock.now
         fetch.pausedAt = now
@@ -469,18 +585,21 @@ final class RemoteFile: @unchecked Sendable {
         switch result {
         case .success(let data?):
             fetch.attempt = 0
+            fetch.windowBytes += data.count
             take(data, into: fetch)
             condition.broadcast()
-            if fetch.connection != nil, let end = fetch.end, fetch.position >= end {
-                // The prefetcher reads on from here.
-                closeConnection(fetch)
-            } else if fetch.connection != nil, fetch.partial.isEmpty, fetch.position < blockCount, isCached(fetch.position) {
+            if !fetch.bounded, fetch.connection != nil, fetch.partial.isEmpty, fetch.position < blockCount, isCached(fetch.position) {
                 // It reached blocks another connection brought: read on past them, not through them.
+                // A bounded range is short and reads on to its end instead, which keeps its socket.
                 closeConnection(fetch)
                 resume(fetch)
             } else {
                 resume(fetch)
             }
+        case .success(nil) where fetch.bounded:
+            // The range was read to its end; the next one goes out on the same socket.
+            park(fetch)
+            resume(fetch)
         case .success(nil):
             if fetch.position < blockCount {
                 failed(fetch, RangeConnection.Failure.closedEarly)
@@ -544,7 +663,11 @@ final class RemoteFile: @unchecked Sendable {
             condition.broadcast()
             return
         }
-        let delay = min(0.5 * Double(1 << min(fetch.attempt, 4)), 8)
+        var delay = min(0.5 * Double(1 << min(fetch.attempt, 4)), 8)
+        if case RangeConnection.Failure.throttled(let status, let retryAfter) = error {
+            noteThrottled(status: status, retryAfter: retryAfter)
+            if let retryAfter { delay = max(delay, min(retryAfter, Self.maxRetryAfter)) }
+        }
         fetch.attempt += 1
         fetch.backingOff = true
         let id = fetch.generation
@@ -556,6 +679,26 @@ final class RemoteFile: @unchecked Sendable {
             guard id == fetch.generation else { return }
             fetch.backingOff = false
             self.resume(fetch)
+        }
+    }
+
+    /// The server asked for fewer or later requests: nothing opens before its `Retry-After`,
+    /// and never more connections at once than were open when it asked, less one.
+    private func noteThrottled(status: Int, retryAfter: TimeInterval?) {
+        if let retryAfter {
+            let until = ContinuousClock.now + .milliseconds(Int(min(retryAfter, Self.maxRetryAfter) * 1000))
+            holdUntil = max(holdUntil ?? until, until)
+        }
+        // The connection it refused is closed by now; it counts as one of those it had.
+        let open = fetches.filter { $0.connection != nil }.count + 1
+        let limit = max(1, open - 1)
+        if limit < connectionLimit ?? .max {
+            connectionLimit = limit
+            logger.notice("Source server answered HTTP \(status) with \(open) connections open; at most \(limit) from now on")
+        }
+        for fetch in fetches {
+            fetch.idle?.cancel()
+            fetch.idle = nil
         }
     }
 

@@ -66,6 +66,8 @@ final class SegmentPipeline: @unchecked Sendable {
     private let fileNamer: @Sendable (Int, Int) -> String
     private let parentToken: CancellationToken
     private let logger: Logger
+    /// Called with the segment a request moved the run to: the player seeked.
+    private let onSeek: (@Sendable (Int) -> Void)?
 
     private let condition = NSCondition()
     private var run: RemuxRun?
@@ -87,7 +89,8 @@ final class SegmentPipeline: @unchecked Sendable {
         token: CancellationToken,
         logger: Logger,
         fileName: @escaping @Sendable (_ segment: Int, _ track: Int) -> String,
-        producer: @escaping @Sendable (_ track: Int) -> SegmentProducer
+        producer: @escaping @Sendable (_ track: Int) -> SegmentProducer,
+        onSeek: (@Sendable (_ segment: Int) -> Void)? = nil
     ) {
         self.name = name
         self.directory = directory
@@ -97,6 +100,7 @@ final class SegmentPipeline: @unchecked Sendable {
         self.logger = logger
         self.fileNamer = fileName
         self.producer = producer
+        self.onSeek = onSeek
     }
 
     func fileName(segment: Int, track: Int) -> String { fileNamer(segment, track) }
@@ -124,6 +128,7 @@ final class SegmentPipeline: @unchecked Sendable {
                 } else if needsRestart(for: index) {
                     logger.notice("\(name): segment \(index) is outside the window (producing \(producing)), restarting")
                     restart(at: index, track: requestedTrack)
+                    onSeek?(index)
                 } else {
                     advance(to: index)
                 }
@@ -132,6 +137,17 @@ final class SegmentPipeline: @unchecked Sendable {
         } onCancel: {
             cancelWaiter(waiterID, segment: index)
         }
+    }
+
+    /// Starts producing at `index` before anything is asked for, so the first segments are on
+    /// their way while the player gets ready. Does nothing once a run exists.
+    func prepare(at index: Int, track: Int = 0) {
+        guard index >= 0, index < segmentCount else { return }
+        condition.lock()
+        defer { condition.unlock() }
+        guard !stopped, run == nil else { return }
+        logger.info("\(name): producing segment \(index) ahead of the player")
+        restart(at: index, track: track)
     }
 
     /// A segment response ended. Once the player has the bytes the file is deleted;

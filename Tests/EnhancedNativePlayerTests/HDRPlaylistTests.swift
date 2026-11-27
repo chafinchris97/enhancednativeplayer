@@ -105,6 +105,31 @@ struct HDR10PlusTests {
         #expect(lines[0].contains("VIDEO-RANGE=PQ"))
         #expect(!builder.master(sdr: true).contains("cdm4"))
     }
+
+    @Test func mediaPlaylistsBeginWhereTheyAreToldTo() {
+        let ms = Rational(num: 1, den: 1000)
+        let plan = SegmentPlan(keyframes: [0, 6000], timeBase: ms, hlsTime: 6, end: 12000)
+        let video = VideoTrack(
+            streamIndex: 0, codec: .hevc, timeBase: ms, width: 3840, height: 2160, frameRate: 24,
+            frameDuration: 42, reorderDepth: 0, bitRate: nil, range: .pq, dolbyVision: nil,
+            extradata: hvcC, profile: 2, level: 153
+        )
+        let media = MediaInfo(
+            formatName: "matroska", fileSize: 1_000_000, durationSeconds: 12, bitRate: nil, video: video,
+            audio: [], subtitles: [],
+            keyframes: KeyframeIndex(timestamps: [0, 6000], positions: [0, 1], timeBase: ms, usesDecodeTimestamps: false, presentationOffset: 0),
+            videoEndTimestamp: 12000
+        )
+        let builder = PlaylistBuilder(media: media, plan: plan, subtitleGrid: SubtitleGrid(totalTicks: 120_000_000))
+        for playlist in [builder.videoPlaylist(start: 7.25), builder.sdrVideoPlaylist(start: 7.25), builder.audioPlaylist(track: 0, start: 7.25)] {
+            let lines = playlist.split(separator: "\n")
+            let start = lines.firstIndex(of: "#EXT-X-START:TIME-OFFSET=7.250,PRECISE=YES")
+            #expect(start != nil)
+            #expect(start.map { $0 < lines.firstIndex { $0.hasPrefix("#EXTINF") }! } == true)
+        }
+        #expect(!builder.videoPlaylist().contains("EXT-X-START"))
+        #expect(!builder.videoPlaylist(start: 0).contains("EXT-X-START"))
+    }
 }
 
 /// The init summary the server logs, read back from a sample entry with a dvvC.

@@ -150,16 +150,18 @@ struct PlaylistBuilder: Sendable {
 
     // MARK: Media playlists
 
-    func videoPlaylist() -> String {
-        mediaPlaylist(map: "init_video.mp4") { "video_\($0).mp4" }
+    /// `start`, seconds into the playlist, is where AVPlayer begins (`EXT-X-START`), so its
+    /// first request is for the segment playback starts in rather than the first one.
+    func videoPlaylist(start: TimeInterval? = nil) -> String {
+        mediaPlaylist(map: "init_video.mp4", start: start) { "video_\($0).mp4" }
     }
 
-    func sdrVideoPlaylist() -> String {
-        mediaPlaylist(map: "init_video_sdr.mp4") { "video_sdr_\($0).mp4" }
+    func sdrVideoPlaylist(start: TimeInterval? = nil) -> String {
+        mediaPlaylist(map: "init_video_sdr.mp4", start: start) { "video_sdr_\($0).mp4" }
     }
 
-    func audioPlaylist(track: Int) -> String {
-        mediaPlaylist(map: "audio_\(track)_init.mp4") { "audio_\(track)_\($0).mp4" }
+    func audioPlaylist(track: Int, start: TimeInterval? = nil) -> String {
+        mediaPlaylist(map: "audio_\(track)_init.mp4", start: start) { "audio_\(track)_\($0).mp4" }
     }
 
     /// Subtitles have their own fixed 10 s segments, independent of the video cuts. An external
@@ -189,15 +191,18 @@ struct PlaylistBuilder: Sendable {
     }
 
     /// Audio segments use the video cuts, so both playlists share every EXTINF.
-    private func mediaPlaylist(map: String, segmentName: (Int) -> String) -> String {
+    private func mediaPlaylist(map: String, start: TimeInterval?, segmentName: (Int) -> String) -> String {
         var lines = [
             "#EXTM3U",
             "#EXT-X-VERSION:7",
             "#EXT-X-TARGETDURATION:\(plan.targetDuration)",
             "#EXT-X-MEDIA-SEQUENCE:0",
             "#EXT-X-PLAYLIST-TYPE:VOD",
-            "#EXT-X-MAP:URI=\"\(map)\"",
         ]
+        if let start, start > 0 {
+            lines.append(String(format: "#EXT-X-START:TIME-OFFSET=%.3f,PRECISE=YES", start))
+        }
+        lines.append("#EXT-X-MAP:URI=\"\(map)\"")
         for segment in plan.segments {
             lines.append(String(format: "#EXTINF:%f,", segment.duration))
             lines.append("\(segmentName(segment.index))?runtimeTicks=\(segment.runtimeTicks)")

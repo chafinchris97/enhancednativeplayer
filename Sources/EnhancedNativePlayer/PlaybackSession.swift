@@ -209,6 +209,19 @@ final class EnhancedPlaybackSession: Sendable {
         core.startSelection.withLock { $0 = selection }
     }
 
+    /// Where the media playlists say playback begins, in seconds of the playlist timeline;
+    /// nil for the beginning. Set before the player reads them.
+    func setStartOffset(_ seconds: TimeInterval?) {
+        core.startOffset.withLock { $0 = seconds }
+    }
+
+    /// Starts producing the video and default audio segments playback starts in, `seconds`
+    /// into the playlist, before the player asks for them: they are made while the display
+    /// switches mode instead of after.
+    func prepareSegments(at seconds: TimeInterval, selection: StartSelection) {
+        core.prepareSegments(at: seconds, audioTrack: defaultAudioIndex(selection) ?? 0)
+    }
+
     /// The audio track playback starts with for `selection`, which the player selects itself.
     func defaultAudioIndex(_ selection: StartSelection) -> Int? {
         core.playlists.defaultAudioIndex(selection)
@@ -403,12 +416,14 @@ final class PlaybackSessionCore: Sendable {
     private let sdrVideo: SegmentPipeline
     private let audio: SegmentPipeline
     private let inits = InitSegmentStore()
-    private let subtitleCues = SubtitleSegmentCache<[SubtitleCue]>()
+    private let subtitleCues: SubtitleSegmentCache<[SubtitleCue]>
     let pgsFrames: PGSFrameStore
     let assEvents: ASSEventStore
     let externalFonts: [ASSFont]
     /// Which tracks the master marks DEFAULT.
     let startSelection = Mutex(StartSelection())
+    /// Where the media playlists say playback begins, in seconds of the playlist timeline.
+    let startOffset = Mutex<TimeInterval?>(nil)
     /// Holds a run's first video segment until the player has decoded its frame; nil unless the
     /// player draws the video.
     let videoGate: VideoStartGate?
@@ -432,6 +447,16 @@ final class PlaybackSessionCore: Sendable {
         self.playlists = playlists
         pgsFrames = PGSFrameStore(context: context)
         assEvents = ASSEventStore(context: context)
+        // A seek stops the subtitle reads still running for the position it left. Those
+        // from one segment before the new position to a minute after it stay.
+        let subtitleCues = SubtitleSegmentCache<[SubtitleCue]>()
+        self.subtitleCues = subtitleCues
+        let grid = context.subtitleGrid
+        let onSeek: @Sendable (Int) -> Void = { segment in
+            guard context.plan.segments.indices.contains(segment), grid.count > 0 else { return }
+            let current = min(Int(context.plan.segments[segment].runtimeTicks / SubtitleGrid.segmentTicks), grid.count - 1)
+            Task { await subtitleCues.cancelLoads(outside: max(0, current - 1)...(current + 6)) }
+        }
         video = SegmentPipeline(
             name: "video",
             directory: directory.url.appendingPathComponent("video", isDirectory: true),
@@ -442,7 +467,8 @@ final class PlaybackSessionCore: Sendable {
             fileName: { segment, _ in "video_\(segment).mp4" },
             producer: { _ -> SegmentProducer in
                 context.media.video.rendered == nil ? VideoProducer(context: context) : PlaceholderVideoProducer(context: context)
-            }
+            },
+            onSeek: onSeek
         )
         sdrVideo = SegmentPipeline(
             name: "video_sdr",
@@ -454,7 +480,8 @@ final class PlaybackSessionCore: Sendable {
             fileName: { segment, _ in "video_sdr_\(segment).mp4" },
             producer: { _ -> SegmentProducer in
                 context.media.video.rendered == nil ? VideoProducer(context: context, rewriter: context.sdrRewriter) : PlaceholderVideoProducer(context: context, sdr: true)
-            }
+            },
+            onSeek: onSeek
         )
         audio = SegmentPipeline(
             name: "audio",
@@ -474,6 +501,12 @@ final class PlaybackSessionCore: Sendable {
         )
     }
 
+    func prepareSegments(at seconds: TimeInterval, audioTrack: Int) {
+        let index = context.plan.segmentIndex(forRuntimeTicks: Int64(max(0, seconds) * 10_000_000))
+        video.prepare(at: index)
+        if context.media.audio.indices.contains(audioTrack) { audio.prepare(at: index, track: audioTrack) }
+    }
+
     func respond(to fileName: String, runtimeTicks: Int64?) async -> Response {
         guard let route = HLSRoute(fileName: fileName) else { return Response(status: .notFound) }
         let context = context
@@ -488,10 +521,10 @@ final class PlaybackSessionCore: Sendable {
             case .master:
                 return .playlist(playlists.master(start: startSelection.withLock { $0 }))
             case .videoPlaylist:
-                return .playlist(playlists.videoPlaylist())
+                return .playlist(playlists.videoPlaylist(start: startOffset.withLock { $0 }))
             case .audioPlaylist(let track):
                 guard context.media.audio.indices.contains(track) else { return Response(status: .notFound) }
-                return .playlist(playlists.audioPlaylist(track: track))
+                return .playlist(playlists.audioPlaylist(track: track, start: startOffset.withLock { $0 }))
             case .videoInit:
                 let token = context.token
                 let logger = logger
@@ -527,7 +560,7 @@ final class PlaybackSessionCore: Sendable {
                 return .playlist(playlists.master(sdr: true, start: startSelection.withLock { $0 }))
             case .sdrVideoPlaylist:
                 guard context.hasSDRMaster else { return Response(status: .notFound) }
-                return .playlist(playlists.sdrVideoPlaylist())
+                return .playlist(playlists.sdrVideoPlaylist(start: startOffset.withLock { $0 }))
             case .sdrVideoInit:
                 guard context.hasSDRMaster else { return Response(status: .notFound) }
                 let token = context.token
@@ -558,8 +591,9 @@ final class PlaybackSessionCore: Sendable {
                     return .webVTT(WebVTT.document(shifted))
                 }
                 guard let format = subtitle.textFormat else { return .webVTT(WebVTT.document([])) }
-                let cues = try await subtitleCues.value(track: track, segment: index) {
-                    try SubtitleCueReader.read(context: context, track: subtitle, format: format, segment: index)
+                let token = CancellationToken(parent: context.token)
+                let cues = try await subtitleCues.value(track: track, segment: index, token: token) {
+                    try SubtitleCueReader.read(context: context, track: subtitle, format: format, segment: index, token: token)
                 }
                 return .webVTT(WebVTT.document(cues))
             case .iFramePlaylist:
